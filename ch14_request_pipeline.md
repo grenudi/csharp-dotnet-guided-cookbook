@@ -889,3 +889,127 @@ app.Run();
 > lists every mapped route in the solution with HTTP method, path, and handler.
 > Click any endpoint to navigate to its handler.
 
+
+---
+
+## 14.15 OpenAPI / Swagger — Document Your API
+
+OpenAPI is the standard for describing REST APIs. Swagger UI visualises it interactively.
+
+```csharp
+// Install: Microsoft.AspNetCore.OpenApi (built-in NET 9)
+// Or: Swashbuckle.AspNetCore (more features)
+
+// Basic setup (NET 9 built-in)
+builder.Services.AddOpenApi();
+app.MapOpenApi();
+app.UseSwaggerUI(opts => opts.SwaggerEndpoint("/openapi/v1.json", "My API v1"));
+
+// With Swashbuckle (more control)
+builder.Services.AddSwaggerGen(opts =>
+{
+    opts.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title       = "My API",
+        Version     = "v1",
+        Description = "Description of what this API does",
+    });
+
+    // Include XML comments from your code
+    var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+    opts.IncludeXmlComments(Path.Combine(AppContext.BaseDirectory, xmlFile));
+
+    // JWT auth in Swagger UI
+    opts.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        Description = "Enter JWT token"
+    });
+    opts.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        [new OpenApiSecurityScheme
+        {
+            Reference = new OpenApiReference
+                { Type = ReferenceType.SecurityScheme, Id = "Bearer" }
+        }] = Array.Empty<string>()
+    });
+});
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+```
+
+### Annotating Endpoints
+
+```csharp
+// Controllers: XML comments + attributes
+/// <summary>Creates a new order.</summary>
+/// <param name="req">The order creation request.</param>
+/// <returns>The created order.</returns>
+/// <response code="201">Order created successfully.</response>
+/// <response code="400">Invalid request data.</response>
+[HttpPost]
+[ProducesResponseType<OrderDto>(StatusCodes.Status201Created)]
+[ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+public async Task<IActionResult> CreateOrder(CreateOrderRequest req) { }
+
+// Minimal APIs: fluent
+app.MapPost("/orders", CreateOrder)
+    .WithName("CreateOrder")
+    .WithSummary("Create a new order")
+    .WithDescription("Creates a new order for the authenticated customer")
+    .WithTags("Orders")
+    .Produces<OrderDto>(StatusCodes.Status201Created)
+    .ProducesValidationProblem()
+    .RequireAuthorization();
+```
+
+---
+
+
+---
+
+## 14.16 API Versioning
+
+APIs change over time. Versioning lets you introduce breaking changes without
+breaking existing clients.
+
+```csharp
+// Install: Asp.Versioning.Http
+
+builder.Services.AddApiVersioning(opts =>
+{
+    opts.DefaultApiVersion       = new ApiVersion(1, 0);
+    opts.AssumeDefaultVersionWhenUnspecified = true;
+    opts.ReportApiVersions       = true;  // adds api-supported-versions header
+    opts.ApiVersionReader = ApiVersionReader.Combine(
+        new UrlSegmentApiVersionReader(),       // /api/v1/orders
+        new HeaderApiVersionReader("api-version"), // header: api-version: 1.0
+        new QueryStringApiVersionReader("api-version")); // ?api-version=1.0
+}).AddApiExplorer(opts =>
+{
+    opts.GroupNameFormat          = "'v'VVV";
+    opts.SubstituteApiVersionInUrl = true;
+});
+
+// URL segment versioning
+var v1 = app.MapGroup("/api/v{version:apiVersion}/orders")
+    .HasApiVersion(1.0);
+var v2 = app.MapGroup("/api/v{version:apiVersion}/orders")
+    .HasApiVersion(2.0);
+
+v1.MapGet("/", ListOrdersV1);
+v2.MapGet("/", ListOrdersV2);  // improved response format
+
+// Mark deprecated version
+app.MapGet("/api/v1/old-endpoint", handler)
+    .HasDeprecatedApiVersion(1.0);
+```
+
+---
+

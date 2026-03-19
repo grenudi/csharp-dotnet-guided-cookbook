@@ -836,3 +836,57 @@ Console.WriteLine(expando.Name);
 
 > **VS tip:** *Analyze → Run Code Analysis on Solution* → *Nullable reference types* rule set catches all NRT issues project-wide.
 
+
+---
+
+## 2.13 Primary Constructors (C# 12)
+
+Primary constructors bring constructor parameters directly into the class body,
+eliminating the boilerplate of declaring a field and assigning it:
+
+```csharp
+// C# 12+ primary constructor on class
+public class OrderService(
+    IOrderRepository orders,
+    IEmailSender email,
+    ILogger<OrderService> logger)
+{
+    // Parameters are in scope for the entire class body
+    public async Task PlaceOrderAsync(Order order, CancellationToken ct)
+    {
+        await orders.SaveAsync(order, ct);                         // direct use
+        await email.SendAsync(order.CustomerEmail, "Confirmed", ct);
+        logger.LogInformation("Order {Id} placed", order.Id);
+    }
+}
+
+// The old equivalent (still valid, sometimes clearer):
+public class OrderService
+{
+    private readonly IOrderRepository _orders;
+    private readonly IEmailSender     _email;
+    private readonly ILogger<OrderService> _logger;
+
+    public OrderService(IOrderRepository orders, IEmailSender email,
+        ILogger<OrderService> logger)
+    {
+        _orders = orders;
+        _email  = email;
+        _logger = logger;
+    }
+}
+
+// Primary constructors also work on structs:
+public readonly struct Temperature(double celsius)
+{
+    public double Celsius    => celsius;
+    public double Fahrenheit => celsius * 9 / 5 + 32;
+}
+```
+
+**When to prefer primary constructors:** service classes with many injected dependencies
+where you don't need field-level access modifiers or XML doc comments per field.
+**When to avoid:** when you need to validate parameters before assignment, or when
+field names in the IDE are important for navigation.
+
+

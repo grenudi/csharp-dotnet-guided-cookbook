@@ -539,3 +539,91 @@ foreach (var host in results)
 
 > **VS tip:** *View → Other Windows → Web API Tester* (or install the *REST Client* extension). Rider's HTTP client is more full-featured for this use case.
 
+
+---
+
+## 13.6 SignalR — Real-Time Communication
+
+SignalR provides real-time bidirectional communication between server and clients.
+Used for: live dashboards, chat, notifications, collaborative editing.
+
+```csharp
+// Install: Microsoft.AspNetCore.SignalR
+
+// Hub definition
+public class NotificationHub : Hub
+{
+    // Server → specific client
+    public async Task SendToUser(string userId, string message)
+        => await Clients.User(userId).SendAsync("ReceiveNotification", message);
+
+    // Server → group
+    public async Task JoinGroup(string groupName)
+    {
+        await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
+        await Clients.Group(groupName).SendAsync("UserJoined", Context.ConnectionId);
+    }
+
+    // Client → server (called from browser)
+    public async Task SendMessage(string message)
+    {
+        var user = Context.User?.Identity?.Name ?? "Anonymous";
+        await Clients.All.SendAsync("ReceiveMessage", user, message);
+    }
+
+    // Connection lifecycle
+    public override async Task OnConnectedAsync()
+    {
+        await base.OnConnectedAsync();
+        Console.WriteLine($"Connected: {Context.ConnectionId}");
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? ex)
+    {
+        Console.WriteLine($"Disconnected: {Context.ConnectionId}");
+        await base.OnDisconnectedAsync(ex);
+    }
+}
+
+// Program.cs
+builder.Services.AddSignalR();
+app.MapHub<NotificationHub>("/hubs/notifications");
+
+// Send from anywhere in the app (inject IHubContext)
+public class OrderService
+{
+    private readonly IHubContext<NotificationHub> _hub;
+
+    public OrderService(IHubContext<NotificationHub> hub) => _hub = hub;
+
+    public async Task PlaceOrderAsync(Order order, CancellationToken ct)
+    {
+        await _repo.SaveAsync(order, ct);
+        // Push real-time notification to all clients
+        await _hub.Clients.All.SendAsync("OrderPlaced",
+            new { order.Id, order.Total }, ct);
+    }
+}
+```
+
+```javascript
+// Client (JavaScript)
+const connection = new signalR.HubConnectionBuilder()
+    .withUrl("/hubs/notifications")
+    .withAutomaticReconnect()
+    .build();
+
+connection.on("ReceiveNotification", (message) => {
+    console.log("Notification:", message);
+});
+
+connection.on("OrderPlaced", (data) => {
+    updateDashboard(data);
+});
+
+await connection.start();
+await connection.invoke("JoinGroup", "dashboard");
+```
+
+---
+

@@ -658,3 +658,69 @@ while (true)
 
 > **VS tip:** *View → SQL Server Object Explorer* for SQL Server. For SQLite, use the *SQLite/SQL Server Compact Toolbox* extension. The EF Core Power Tools extension adds a visual schema diagram and reverse-engineering tools.
 
+
+---
+
+## 15.12 IEnumerable vs IQueryable — Critical Distinction
+
+This distinction directly affects whether your queries run in the database or in memory.
+
+```csharp
+// IEnumerable<T> — in-memory, evaluated locally
+IEnumerable<User> query = _db.Users.AsEnumerable()
+    .Where(u => u.Age > 18);
+// SQL: SELECT * FROM users    ← ALL rows loaded into memory FIRST
+// Then C# filters in memory. Returns 5 rows from 1 million.
+
+// IQueryable<T> — translated to SQL, evaluated at the database
+IQueryable<User> query = _db.Users
+    .Where(u => u.Age > 18);
+// SQL: SELECT * FROM users WHERE age > 18    ← database filters
+// Only the 5 matching rows are transferred. The rest never leave the DB.
+```
+
+### When Each Is Used
+
+```csharp
+// IQueryable: LINQ against DbSet — composed into SQL
+var adults = _db.Users.Where(u => u.Age > 18);           // IQueryable
+var named  = adults.Where(u => u.Name.StartsWith("A")); // still IQueryable
+// One SQL query: WHERE age > 18 AND name LIKE 'A%'
+
+// IEnumerable: anything after ToList/ToArray/AsEnumerable/foreach
+var list = _db.Users.ToList();              // IEnumerable — all rows in memory
+var filtered = list.Where(u => u.Age > 18); // in-memory LINQ
+
+// The classic mistake
+var report = _db.Orders
+    .AsEnumerable()                              // ← switches to in-memory!
+    .Where(o => ExpensiveLocalFunction(o))       // .NET function, can't translate
+    .ToList();
+// Loads ALL orders, then filters. Use AsEnumerable() only when:
+// - you need a .NET function that can't be translated to SQL
+// - you know the dataset is small
+
+// The right way when you need mixed filtering
+var preFiltered = _db.Orders
+    .Where(o => o.Status == OrderStatus.Active)  // SQL filter first
+    .AsEnumerable()                              // then in-memory for complex logic
+    .Where(o => ComplexLocalCheck(o))
+    .ToList();
+```
+
+### IQueryable Pitfalls
+
+```csharp
+// Deferred execution — query runs when enumerated, not when declared
+IQueryable<Order> query = _db.Orders.Where(o => o.Status == status);
+// Nothing happens yet
+
+status = OrderStatus.Cancelled; // change the captured variable
+var orders = query.ToList();    // query now uses "Cancelled", not original value!
+
+// Fix: force evaluation early if you need a snapshot
+var orders = _db.Orders.Where(o => o.Status == status).ToList(); // immediate
+```
+
+---
+
