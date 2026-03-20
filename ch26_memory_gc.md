@@ -1,346 +1,342 @@
 # Chapter 26 — Memory Management & the Garbage Collector
 
-## 26.1 Why This Matters
+> .NET manages memory automatically. Most of the time you write code
+> and never think about memory allocation. But automatic does not mean
+> free — and when your application starts leaking memory, consuming
+> gigabytes, or pausing for GC collection cycles, you need to understand
+> what the runtime is doing on your behalf. This chapter explains the
+> GC model, how to avoid the most common memory problems, and how to
+> diagnose them when they appear.
 
-Most .NET developers never think about memory — and most of the time that is fine.
-The GC handles it. But senior developers need to understand the GC because:
-
-- Memory leaks are real in .NET and they come from specific patterns
-- GC pauses affect latency in high-throughput applications
-- Knowing how the GC works explains why certain patterns (Span<T>, pooling,
-  value types) exist and when to use them
-
----
-
-## 26.2 How the GC Works — The Heap
-
-The managed heap has three generations plus a Large Object Heap:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Managed Heap                             │
-├────────────┬──────────────┬───────────────┬─────────────────┤
-│  Gen 0     │    Gen 1     │    Gen 2       │  LOH (Large)   │
-│ ~256 KB    │  ~2 MB       │  Unlimited     │  ≥85,000 bytes │
-├────────────┴──────────────┴───────────────┴─────────────────┤
-│  New objects live here    Objects that survive GCs move up  │
-│  Collected very frequently Collected rarely                  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Generation 0** — new allocations. Collected very frequently (milliseconds).
-**Generation 1** — objects that survived one Gen 0 GC. Buffer between 0 and 2.
-**Generation 2** — long-lived objects. Collected rarely. Full GC = expensive.
-**LOH** — objects ≥ 85,000 bytes. Treated as Gen 2. Not compacted by default.
-
-When you allocate an object:
-1. It goes into Gen 0
-2. If it survives a GC, it is promoted to Gen 1
-3. If it survives again, promoted to Gen 2
-4. Gen 2 objects are only collected during a full GC
-
-**The rule:** short-lived objects are cheap. Long-lived objects are expensive.
-Design for fast allocation and fast death.
+*Building on:* Ch 2 (value types vs reference types — the fundamental
+split between stack and heap allocation), Ch 3 (IDisposable, `using` —
+the mechanism for releasing unmanaged resources), Ch 7 (Span<T> — the
+primary tool for reducing allocations in hot paths)
 
 ---
 
-## 26.3 The IDisposable Pattern — Correctly
+## 26.1 The Stack and the Heap — Where Memory Lives
 
-`IDisposable` is for releasing **unmanaged resources** (file handles, network sockets,
-database connections, native memory). The GC does NOT call `Dispose` — you must.
+Every piece of data in a .NET program lives in one of two places:
 
-```csharp
-// ❌ Resource leak — GC will eventually finalize but you cannot control when
-var conn = new SqlConnection(connectionString);
-conn.Open();
-var result = conn.ExecuteScalar("SELECT COUNT(*) FROM orders");
-// conn is never disposed — connection held until GC finalizes it
-// Under load: connection pool exhausted, new connections fail
+**The stack** is a LIFO (last-in-first-out) block of memory per thread,
+managed automatically by the CPU. Local variables and method parameters
+are pushed when a method is entered and popped when it returns. Allocation
+and deallocation are a single instruction — changing the stack pointer.
+Value types (int, bool, struct, DateTime) typically live on the stack
+when they are local variables.
 
-// ✅ Always use using — guaranteed disposal even on exception
-using var conn = new SqlConnection(connectionString);
-conn.Open();
-var result = conn.ExecuteScalar("SELECT COUNT(*) FROM orders");
-// conn.Dispose() called here — connection returned to pool immediately
+**The heap** is a large region of memory managed by the GC. Reference
+types (class instances) are always heap-allocated. The GC tracks which
+objects are reachable (referenced) and periodically reclaims the memory
+of objects that are no longer referenced.
+
+```
+Thread stack:              Heap:
+│ ...          │          ┌──────────────────────┐
+│ int count=5  │          │ List<Order> ←────────┼── local var 'orders'
+│ Order* ref ──┼──────────┤ Order(Id=1)          │
+│ ...          │          │ Order(Id=2)           │
+└──────────────┘          │ ...                  │
+                          └──────────────────────┘
 ```
 
-### Implementing IDisposable Correctly
+When a method returns, its stack frame is popped instantly. When an
+object on the heap has no more references to it, the GC will eventually
+reclaim its memory — but not immediately.
+
+---
+
+## 26.2 How the Garbage Collector Works
+
+The GC divides heap objects into three generations based on how long
+they have survived. This reflects the empirical observation that most
+objects die young:
+
+```
+Generation 0  — recently allocated objects
+              — collected most frequently (milliseconds)
+              — 90%+ of objects die here
+
+Generation 1  — objects that survived one Gen 0 collection
+              — collected less frequently
+              — a buffer between Gen 0 and Gen 2
+
+Generation 2  — long-lived objects: caches, singletons, static data
+              — collected rarely
+              — collections are expensive (pause the whole process)
+
+Large Object Heap (LOH) — objects ≥ 85KB
+              — collected with Gen 2
+              — fragmentation risk
+              — arrays, large strings, buffers
+```
+
+When the GC runs, it:
+1. Pauses the application (Stop-The-World)
+2. Walks the reference graph from known roots (statics, stack variables)
+3. Marks all reachable objects
+4. Reclaims unreachable objects
+5. Compacts the heap (moves surviving objects together, updates references)
+6. Resumes the application
+
+The pause duration is why GC matters for latency. A Gen 0 collection is
+under a millisecond. A Gen 2 collection on a large heap can pause for
+tens or hundreds of milliseconds — a visible hitch in real-time systems.
+
+### Server GC vs Workstation GC
 
 ```csharp
-// The standard Dispose pattern for classes that own unmanaged resources
-public class FileManager : IDisposable
+// In runtimeconfig.json or host configuration
 {
-    private FileStream? _stream;
-    private bool        _disposed;
+  "configProperties": {
+    "System.GC.Server": true    // Server GC — one heap per CPU core, better throughput
+                                // Default for ASP.NET Core
+                                // Workstation GC — single heap, lower memory, better latency
+  }
+}
+```
 
-    public FileManager(string path)
+---
+
+## 26.3 `IDisposable` — Releasing Unmanaged Resources
+
+The GC handles managed memory. It does not handle unmanaged resources:
+file handles, database connections, network sockets, unmanaged memory
+buffers, OS handles. These must be released explicitly.
+
+`IDisposable` is the contract: implement `Dispose()` to release resources.
+The `using` statement guarantees `Dispose()` is called, even if an
+exception is thrown.
+
+```csharp
+// The complete IDisposable pattern
+public class DatabaseConnection : IDisposable
+{
+    private SqliteConnection? _conn;
+    private bool _disposed;
+
+    public DatabaseConnection(string connectionString)
     {
-        _stream = new FileStream(path, FileMode.Open);
+        _conn = new SqliteConnection(connectionString);
+        _conn.Open();
     }
 
-    // Called by consumer code via using statement
     public void Dispose()
     {
         Dispose(disposing: true);
-        GC.SuppressFinalize(this);  // tell GC not to call finalizer
-    }
-
-    // Called by GC finalizer (safety net if consumer forgot to Dispose)
-    ~FileManager()
-    {
-        Dispose(disposing: false);
+        GC.SuppressFinalize(this);  // prevent finaliser from running — we already cleaned up
     }
 
     protected virtual void Dispose(bool disposing)
     {
         if (_disposed) return;
-
         if (disposing)
         {
-            // Free managed resources (other IDisposable objects)
-            _stream?.Dispose();
-            _stream = null;
+            // Release managed resources that are themselves IDisposable
+            _conn?.Dispose();
+            _conn = null;
         }
-        // Free unmanaged resources here (always, regardless of disposing flag)
-
+        // If there were unmanaged resources (IntPtr, SafeHandle), release them here
         _disposed = true;
     }
 
-    public void Write(string text)
+    // Finaliser: safety net if the caller forgot to call Dispose()
+    // Only needed if you hold unmanaged resources directly (rare)
+    ~DatabaseConnection()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        // ...
+        Dispose(disposing: false);
     }
 }
+
+// Caller always uses 'using'
+using var conn = new DatabaseConnection(connectionString);
+// ... use conn ...
+// conn.Dispose() called here even if an exception occurs
 ```
 
-### Simplified Pattern (Most Cases)
+### `IAsyncDisposable` — For Async Cleanup
+
+When resource release requires async work (flushing a buffer, closing
+a gRPC channel gracefully), implement `IAsyncDisposable`:
 
 ```csharp
-// For classes that only own managed IDisposable objects (no native resources):
-// Skip the finalizer — it's only needed for raw unmanaged resources
-public class OrderProcessor : IDisposable
+public class AsyncResourceHolder : IAsyncDisposable
 {
-    private readonly HttpClient      _http;
-    private readonly AppDbContext    _db;
-    private bool                     _disposed;
-
-    public OrderProcessor(HttpClient http, AppDbContext db)
-    { _http = http; _db = db; }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _http.Dispose();
-        _db.Dispose();
-        _disposed = true;
-    }
-}
-```
-
-### IAsyncDisposable
-
-```csharp
-// For classes with async cleanup (DB transactions, network connections)
-public class AsyncResource : IAsyncDisposable
-{
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private Stream? _stream;
 
     public async ValueTask DisposeAsync()
     {
-        await FlushAsync();          // drain pending work before closing
-        _lock.Dispose();
+        if (_stream is not null)
+        {
+            await _stream.FlushAsync();
+            await _stream.DisposeAsync();
+            _stream = null;
+        }
         GC.SuppressFinalize(this);
     }
-
-    private async Task FlushAsync() { /* flush buffers */ }
 }
 
-// Usage
-await using var resource = new AsyncResource();
-// resource.DisposeAsync() called automatically
+// Always prefer await using for IAsyncDisposable
+await using var holder = new AsyncResourceHolder();
 ```
 
 ---
 
-## 26.4 Common Memory Leak Patterns
+## 26.4 Memory Leaks — What Causes Them in .NET
 
-### Event Handler Leak
+A memory leak in .NET means: objects are being kept alive by references
+that you forgot to clear. The GC cannot collect what it cannot see is
+unused. Three patterns cause most leaks:
+
+### Leak 1 — Event Handler Not Unsubscribed
 
 ```csharp
-// ❌ Classic leak — subscriber holds a reference to publisher via event
-public class OrderService
+// The publisher holds a reference to every subscriber through the event delegate
+// If the subscriber is unsubscribed, it stays alive as long as the publisher does
+public class DataService
 {
-    public event EventHandler<OrderEventArgs>? OrderPlaced;
+    public event EventHandler<DataChangedEventArgs>? DataChanged;
 }
 
-public class EmailNotifier
+public class MyView
 {
-    private readonly OrderService _service;
+    private readonly DataService _service;
 
-    public EmailNotifier(OrderService service)
+    public MyView(DataService service)
     {
         _service = service;
-        _service.OrderPlaced += OnOrderPlaced;  // publisher holds reference to this!
+        _service.DataChanged += OnDataChanged;  // creates reference: service → view
     }
 
-    private void OnOrderPlaced(object? sender, OrderEventArgs e) { /* ... */ }
+    private void OnDataChanged(object? s, DataChangedEventArgs e) { /* ... */ }
 
-    // If EmailNotifier is "discarded" but OrderService lives on,
-    // EmailNotifier is never GC'd — it's still referenced by the event
+    public void Close()
+    {
+        // MUST unsubscribe — otherwise DataService holds this view alive forever
+        _service.DataChanged -= OnDataChanged;
+    }
 }
+```
 
-// ✅ Fix: unsubscribe in Dispose
-public class EmailNotifier : IDisposable
+### Leak 2 — Static References Holding Dynamic Data
+
+```csharp
+// Static fields live for the application lifetime
+// Anything a static holds lives for the application lifetime
+public static class GlobalCache
 {
-    public EmailNotifier(OrderService service)
-    {
-        _service = service;
-        _service.OrderPlaced += OnOrderPlaced;
-    }
+    // This cache grows forever if items are never removed
+    private static readonly Dictionary<string, UserSession> _sessions = new();
 
-    public void Dispose()
-    {
-        _service.OrderPlaced -= OnOrderPlaced;  // unsubscribe
-    }
+    public static void AddSession(string id, UserSession s) => _sessions[id] = s;
+    // Missing: expiry, eviction, cleanup
 }
 ```
 
-### Static Field Leak
+### Leak 3 — Captured Variables in Long-Lived Lambdas
 
 ```csharp
-// ❌ Leak: static dictionary grows forever — objects can never be GC'd
-private static readonly Dictionary<string, UserSession> _sessions = new();
+// The lambda captures 'data' — keeps it alive as long as the lambda lives
+byte[] data = LoadLargeData();   // 100MB array
 
-public void AddSession(string token, UserSession session)
-    => _sessions[token] = session;  // grows forever — no eviction
-
-// ✅ Use IMemoryCache with expiry (see Chapter 27)
-// ✅ Or use WeakReference for optional caching
-private static readonly Dictionary<string, WeakReference<UserSession>> _cache = new();
-```
-
-### WeakReference — Optional Caching Without Leaks
-
-```csharp
-// WeakReference lets GC collect the object when memory is needed
-// Use when: caching is optional — you can regenerate if the object is collected
-private readonly Dictionary<int, WeakReference<ComputedReport>> _reportCache = new();
-
-public ComputedReport GetReport(int id)
+// If this lambda is stored in a long-lived collection, 'data' is never collected
+_timers.Add(new Timer(_ =>
 {
-    if (_reportCache.TryGetValue(id, out var weak) &&
-        weak.TryGetTarget(out var cached))
-    {
-        return cached;  // still alive
-    }
-
-    // Regenerate — either not cached or GC collected it
-    var report = ComputeExpensiveReport(id);
-    _reportCache[id] = new WeakReference<ComputedReport>(report);
-    return report;
-}
-```
-
-### Closures Capturing Large Objects
-
-```csharp
-// ❌ Closure captures the entire Order — keeps it alive
-byte[] buffer = new byte[10_000_000];  // 10MB
-
-Func<int> getLength = () => buffer.Length;  // buffer stays alive as long as getLength lives
-
-// ✅ Capture only what you need
-int length = buffer.Length;
-Func<int> getLength2 = () => length;  // only the int, not the array
-buffer = null!;  // array can now be GC'd
+    Process(data);   // captures data — holds 100MB forever
+}, null, TimeSpan.Zero, TimeSpan.FromHours(1)));
 ```
 
 ---
 
-## 26.5 Reducing GC Pressure
+## 26.5 Reducing GC Pressure — Common Patterns
+
+GC pressure means allocating many short-lived objects, which causes
+frequent Gen 0 collections. In throughput-sensitive code (tight loops,
+high-frequency request handlers), reducing allocations measurably
+improves performance.
 
 ### Object Pooling
 
 ```csharp
-using Microsoft.Extensions.ObjectPool;
+// ArrayPool: reuse byte arrays instead of allocating new ones
+// Avoids putting large arrays on the LOH
+byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
+try
+{
+    int read = await stream.ReadAsync(buffer, ct);
+    Process(buffer[..read]);
+}
+finally
+{
+    ArrayPool<byte>.Shared.Return(buffer);  // return to pool, not GC
+}
 
-// Pool expensive-to-create objects rather than allocating/deallocating
+// ObjectPool<T> from Microsoft.Extensions.ObjectPool for custom types
 var pool = ObjectPool.Create<StringBuilder>();
-
-// Get from pool
-var sb = pool.Get();
+var sb   = pool.Get();
 try
 {
-    sb.Append("Hello ");
-    sb.Append("World");
-    var result = sb.ToString();
-    return result;
+    sb.Append("build something");
+    return sb.ToString();
 }
 finally
 {
-    pool.Return(sb);  // return to pool — not GC'd
-}
-
-// ArrayPool<T> — high-performance array renting
-byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);  // may give >4096
-try
-{
-    int read = await stream.ReadAsync(buffer.AsMemory(0, 4096));
-    Process(buffer.AsSpan(0, read));
-}
-finally
-{
-    ArrayPool<byte>.Shared.Return(buffer);  // return to pool
+    pool.Return(sb);
 }
 ```
 
-### Value Types for Short-Lived Data
+### `Span<T>` and `Memory<T>` — Slice Without Allocation
 
 ```csharp
-// Structs live on the stack (when local) or inline in their container (when field)
-// No GC pressure for short-lived data
+// Without Span: Substring allocates a new string
+string input  = "2024-01-15";
+string year   = input.Substring(0, 4);   // allocates "2024"
+int    parsed = int.Parse(year);          // fine, but string allocated
 
-// ❌ Class — heap allocation + GC pressure for every coordinate
-public class Point { public double X; public double Y; }
+// With Span: zero allocation
+ReadOnlySpan<char> span = input.AsSpan();
+int parsed2 = int.Parse(span[..4]);       // no allocation — span is a view
+```
 
-// ✅ Struct — stack-allocated when local, no GC involved
+### Struct and `readonly struct` — Stack Allocation
+
+```csharp
+// A readonly struct lives on the stack or inline in the containing object
+// No heap allocation, no GC involvement
 public readonly record struct Point(double X, double Y);
 
-// Processing a million points:
-Point[] points = new Point[1_000_000];  // ONE heap allocation, elements inline
-// vs Point[] with class: 1M heap allocations + GC overhead
+// Array of value types is one heap allocation (the array itself)
+// not N+1 (one for the array plus one per element)
+Point[] points = new Point[1000];   // 1 allocation of 16KB (1000 × 16 bytes)
+                                    // vs 1001 allocations for Point[] with a class type
 ```
 
 ---
 
 ## 26.6 GC Modes and Configuration
 
-```csharp
-// Server GC vs Workstation GC
-// Server GC: one GC heap per CPU core, parallel GC — for server apps
-// Workstation GC: single heap, lower latency — for desktop apps
-// ASP.NET Core uses Server GC by default
-```
+For latency-sensitive applications (real-time trading, game servers,
+interactive applications), you can configure the GC to prefer shorter
+pauses at the cost of higher memory usage:
 
 ```json
-// Configure in runtimeconfig.json or .csproj
+// In runtimeconfig.json
 {
   "configProperties": {
-    "System.GC.Server": true,            // server GC
-    "System.GC.Concurrent": true,        // background GC (default true)
-    "System.GC.HeapHardLimit": 1073741824, // 1GB hard limit
-    "System.GC.HighMemoryPercent": 90    // trigger GC at 90% memory usage
+    "System.GC.Server":         true,   // server GC: one heap per core
+    "System.GC.Concurrent":     true,   // concurrent GC: less stop-the-world
+    "System.GC.HeapHardLimit":  536870912   // 512MB heap limit (useful in containers)
   }
 }
 ```
 
-```xml
-<!-- In .csproj -->
-<PropertyGroup>
-  <ServerGarbageCollection>true</ServerGarbageCollection>
-  <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
-</PropertyGroup>
+For containerised applications, set a memory limit and configure the GC
+to respect it:
+
+```dockerfile
+ENV DOTNET_GCHeapHardLimitPercent=75   # use at most 75% of container memory for GC
+ENV DOTNET_GCConserveMemory=5          # more aggressive collection (0-9 scale)
 ```
 
 ---
@@ -348,61 +344,39 @@ Point[] points = new Point[1_000_000];  // ONE heap allocation, elements inline
 ## 26.7 Diagnosing Memory Problems
 
 ```bash
-# dotnet-counters — live memory metrics
-dotnet counters monitor --process-id <pid> \
-    --counters System.Runtime[gc-heap-size,gen-0-gc-count,gen-1-gc-count,gen-2-gc-count]
+# dotnet-counters: live GC metrics
+dotnet tool install --global dotnet-counters
+dotnet counters monitor --process-id <pid> --counters System.Runtime
 
-# dotnet-dump — capture heap snapshot
-dotnet dump collect --process-id <pid>
+# Watch for:
+# gc-heap-size: total managed heap size
+# gen-0-gc-count / gen-1-gc-count / gen-2-gc-count: collection frequency
+# threadpool-queue-length: sign of thread pool starvation
 
-# Analyze the dump
-dotnet dump analyze ./core_20250115.dmp
-
-# Inside dump analysis:
-# > dumpheap -stat        — object counts and sizes by type
-# > gcroot <address>      — what is keeping this object alive?
-# > eeheap -gc            — GC heap layout
-
-# dotnet-gcdump — GC-specific heap snapshot (smaller, faster)
-dotnet gcdump collect --process-id <pid>
-# Open in Visual Studio or PerfView
+# dotnet-dump: heap snapshot
+dotnet tool install --global dotnet-dump
+dotnet-dump collect --process-id <pid>
+dotnet-dump analyze <dump.dmp>
+> dumpheap -stat         # show top types by size
+> gcroot <address>       # show what's keeping an object alive
 ```
 
-### Memory Leak Investigation in Code
+In Rider, the Memory Profiler shows allocation hotspots. In Visual
+Studio 2022, the Diagnostic Tools window shows real-time GC events.
 
-```csharp
-// Add memory tracking to find leaks in tests
-[Fact]
-public void Operation_DoesNotLeak()
-{
-    // Force GC to establish baseline
-    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-    GC.WaitForPendingFinalizers();
-    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+---
 
-    long before = GC.GetTotalMemory(forceFullCollection: false);
+## 26.8 Connecting Memory to the Rest of the Book
 
-    // Run the operation 1000 times
-    for (int i = 0; i < 1000; i++)
-        RunOperation();
-
-    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-    GC.WaitForPendingFinalizers();
-    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-
-    long after = GC.GetTotalMemory(forceFullCollection: false);
-    long perOp = (after - before) / 1000;
-
-    // If perOp >> 0, something is leaking
-    Assert.True(perOp < 1000, $"Possible memory leak: {perOp} bytes/op retained");
-}
-```
-
-> **Rider tip:** *Run → dotMemory Session* attaches the JetBrains memory profiler.
-> Take a snapshot, run your operation, take another snapshot, and use *Compare* to
-> see exactly which objects were created and not collected. Filter by "Survived" to
-> find leaks immediately.
-
-> **VS tip:** *Debug → Performance Profiler → .NET Object Allocation Tracking* shows
-> every allocation with its call stack. *Memory Usage* shows heap snapshots. Both are
-> in `Alt+F2 → Performance Profiler`.
+- **Ch 2 (Types)** — value types vs reference types is the stack vs
+  heap allocation distinction. Records, structs, and the choice between
+  them directly impacts GC load.
+- **Ch 3 (IDisposable)** — `using` statements are the mechanism for
+  deterministic cleanup of unmanaged resources. Never skip them for
+  streams, connections, or OS handles.
+- **Ch 7 (Span<T>)** — Span is the primary tool for zero-allocation
+  data slicing and parsing. Covered in context of collections.
+- **Ch 21 (Native AOT)** — AOT binaries have different GC characteristics:
+  no JIT allocations during warmup, potentially different GC tuning.
+- **Ch 38 (Multithreading)** — `ImmutableDictionary` and persistent
+  data structures trade CPU for allocation-free thread-safe reads.

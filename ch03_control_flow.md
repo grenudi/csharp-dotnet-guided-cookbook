@@ -1,626 +1,406 @@
 # Chapter 3 — Control Flow & Pattern Matching
 
-## 3.1 Basic Control Flow
+> Control flow is the logic that decides which code runs and when. C#
+> has inherited decades of `if`/`else`/`switch` evolution, but C# 7–11
+> added pattern matching — a genuinely different way of reasoning about
+> data that eliminates whole categories of bugs that are invisible in
+> the old style. This chapter teaches both, and explains why patterns
+> are not just syntax sugar but a different mental model.
 
-### if / else
+*Building on:* Ch 2 (types, records, tuples) — pattern matching operates
+on types and destructures records.
+
+---
+
+## 3.1 Basic Control Flow — What You Already Know
+
+The fundamental constructs are universal. C# syntax follows the C family.
 
 ```csharp
-// Classic
-if (x > 0)
-{
-    Console.WriteLine("positive");
-}
-else if (x < 0)
-{
-    Console.WriteLine("negative");
-}
+// if / else
+if (temperature > 100)
+    Console.WriteLine("Boiling");
+else if (temperature > 37)
+    Console.WriteLine("Hot");
 else
+    Console.WriteLine("Normal");
+
+// Always use braces — see the .editorconfig rule and the bug it prevents:
+// Without braces, adding a second statement under an if looks guarded but isn't
+if (isAdmin)
 {
-    Console.WriteLine("zero");
+    Log("Admin action");
+    ExecuteAdminTask();   // clearly inside the if
 }
 
-// Single-line (omit braces only for trivial cases)
-if (flag) return;
-
-// Ternary
-string label = x > 0 ? "positive" : x < 0 ? "negative" : "zero";
-
-// Null coalescing
-string result = maybeNull ?? "default";
-
-// Null conditional
-int? length = maybeString?.Length;
-string? upper = maybeString?.ToUpperInvariant();
-
-// Null conditional + coalescing
-string safe = maybeString?.Trim() ?? "";
-
-// Null coalescing assignment (C# 8+)
-cache ??= ComputeExpensive();
-```
-
-### for / foreach / while / do-while
-
-```csharp
-// for — classic index-based loop
-for (int i = 0; i < 10; i++)
-    Console.Write(i);
-
-// Reverse
-for (int i = 9; i >= 0; i--)
-    Console.Write(i);
-
-// foreach — most idiomatic for collections
-foreach (var item in collection)
-    Process(item);
-
-// foreach with index (use LINQ or deconstruction)
-foreach (var (item, index) in collection.Select((x, i) => (x, i)))
-    Console.WriteLine($"[{index}] {item}");
+// Ternary: short if-else as an expression
+string label = score >= 60 ? "Pass" : "Fail";
 
 // while
-while (reader.Read())
-    Process(reader.Current);
+int i = 0;
+while (i < 10) { Console.WriteLine(i); i++; }
 
-// do-while — guaranteed at least one execution
-do
-{
-    Console.Write("Enter command: ");
-    command = Console.ReadLine();
-} while (command != "quit");
-```
+// do-while: executes at least once before checking condition
+do { input = Console.ReadLine()!; } while (string.IsNullOrWhiteSpace(input));
 
-### Range & Index (C# 8+)
+// for: when you know the count
+for (int j = 0; j < items.Length; j++)
+    Process(items[j]);
 
-```csharp
-int[] arr = [1, 2, 3, 4, 5];  // collection expression (C# 12)
-
-// Index from end with ^
-int last  = arr[^1];   // 5
-int second = arr[^2];  // 4
-
-// Range [start..end) — end exclusive
-int[] mid  = arr[1..4];   // [2, 3, 4]
-int[] tail = arr[2..];    // [3, 4, 5]
-int[] head = arr[..3];    // [1, 2, 3]
-int[] all  = arr[..];     // [1, 2, 3, 4, 5] (copy)
-
-// Spans — zero allocation slice
-Span<int> spanMid = arr.AsSpan(1, 3); // [2, 3, 4] — no allocation
-
-// for loop with Range
-for (int i = 1; i < arr.Length - 1; i++) { /* ... */ }
+// foreach: the preferred form when you do not need the index
+foreach (var item in items)
+    Process(item);
 ```
 
 ---
 
-## 3.2 Switch Statement vs. Switch Expression
+## 3.2 The Old `switch` Statement and Its Limitations
 
-### Classic switch Statement
+The original `switch` statement works on compile-time constants and
+requires explicit `break` on every case. It cannot match on types,
+conditions, or structure. This forced developers into long `if-else`
+chains for anything beyond simple equality checks:
 
 ```csharp
-switch (status)
+// Old style: if-else chain for type-based dispatch
+void DrawShape(object shape)
 {
-    case HttpStatusCode.OK:
-        HandleSuccess();
-        break;
-    case HttpStatusCode.NotFound:
-    case HttpStatusCode.Gone:      // fall-through to share handler
-        HandleMissing();
-        break;
-    case HttpStatusCode.Unauthorized:
-    case HttpStatusCode.Forbidden:
-        HandleAuth();
-        break;
-    default:
-        HandleUnknown();
-        break;
+    if (shape is Circle c)
+        DrawCircle(c.Radius);
+    else if (shape is Rectangle r)
+        DrawRectangle(r.Width, r.Height);
+    else if (shape is Triangle t)
+        DrawTriangle(t.Base, t.Height);
+    else
+        throw new ArgumentException($"Unknown shape: {shape.GetType()}");
 }
 ```
 
-### Switch Expression (C# 8+)
+Problems with this pattern:
+- Adding a new shape type requires finding every such chain in the codebase
+- The compiler cannot tell you if you missed a case
+- The type cast (`as Circle`) and the null check (`if (c != null)`) are
+  visually separate, allowing bugs where you use a null reference
 
-Returns a value. No `break`. Exhaustiveness checked by compiler.
-
-```csharp
-string description = status switch
-{
-    HttpStatusCode.OK          => "Success",
-    HttpStatusCode.NotFound    => "Not Found",
-    HttpStatusCode.Unauthorized => "Unauthorized",
-    _ => "Other"
-};
-
-// With complex expressions
-decimal discount = customerType switch
-{
-    CustomerType.Gold   when totalPurchases > 10_000 => 0.20m,
-    CustomerType.Gold                                 => 0.15m,
-    CustomerType.Silver when totalPurchases > 5_000  => 0.10m,
-    CustomerType.Silver                               => 0.05m,
-    CustomerType.Bronze                               => 0.0m,
-    _                                                 => throw new ArgumentOutOfRangeException()
-};
-```
+Pattern matching solves all three.
 
 ---
 
-## 3.3 Pattern Matching — Complete Reference
+## 3.3 Pattern Matching — The Modern Approach
 
-C# pattern matching lets you test a value's shape, type, and content in one expression.
+Pattern matching is a way to simultaneously test a value's shape (type,
+structure, or conditions) and extract parts of it in one expression.
+Introduced in C# 7 and significantly extended through C# 11, it
+fundamentally changes how you write conditional logic.
 
-### Type Pattern
+The key insight: patterns are *irrefutable* in the case where they match.
+Inside a pattern match, the compiler knows exactly what type you have and
+has already done the null check. No casting, no null guards, no brittle
+chains.
+
+### Type Patterns
 
 ```csharp
-object obj = GetObject();
+// is-pattern: test type and bind in one step
+object value = GetValue();
 
-// is-type
-if (obj is string s)
-{
-    Console.WriteLine(s.ToUpper()); // s is string here
-}
+if (value is string s)
+    Console.WriteLine($"String of length {s.Length}");  // s is guaranteed string here
 
-// switch expression with type pattern
-string Describe(object o) => o switch
+if (value is int n && n > 0)
+    Console.WriteLine($"Positive int: {n}");
+
+// switch expression with type patterns
+string Describe(object obj) => obj switch
 {
-    int n           => $"integer: {n}",
-    string s        => $"string: {s}",
-    double d        => $"double: {d:F2}",
-    bool b          => $"bool: {b}",
-    null            => "null",
-    _               => $"unknown: {o.GetType().Name}"
+    int n          => $"integer {n}",
+    string s       => $"string '{s}'",
+    null           => "null",
+    _              => $"other: {obj.GetType().Name}"  // _ is the discard (default)
 };
 ```
 
-### Constant Pattern
+### Property Patterns — Match on Structure
+
+Property patterns let you match on the *values of properties*, not just
+the type. This is where pattern matching becomes genuinely expressive:
 
 ```csharp
-int result = value switch
+// Instead of: if (order != null && order.Status == Status.Pending && order.Total > 100)
+bool IsHighValuePending(Order? order) => order is
 {
-    0 => 0,
-    1 => 1,
-    2 => 4,
-    _ => value * value
+    Status: Status.Pending,
+    Total: > 100m
 };
 
-// null check
-if (obj is null) return;
-if (obj is not null) Use(obj);
-```
-
-### Relational Pattern (C# 9+)
-
-```csharp
-string Grade(int score) => score switch
+// Nested property patterns
+string ClassifyCustomer(Customer customer) => customer switch
 {
-    >= 90 => "A",
-    >= 80 => "B",
-    >= 70 => "C",
-    >= 60 => "D",
-    _     => "F"
-};
-
-// With ranges
-bool IsWorkingAge(int age) => age is >= 16 and <= 65;
-bool IsTeenager(int age)   => age is >= 13 and <= 19;
-```
-
-### Logical Pattern (`and`, `or`, `not`)
-
-```csharp
-// not
-if (x is not null) { }
-if (x is not (> 0 and < 10)) { }
-
-// and — both must match
-bool InRange(int x) => x is >= 1 and <= 100;
-
-// or — either must match
-bool IsWeekend(DayOfWeek day) => day is DayOfWeek.Saturday or DayOfWeek.Sunday;
-
-// Combine freely
-string Classify(int n) => n switch
-{
-    < 0                    => "negative",
-    0                      => "zero",
-    > 0 and < 10          => "small positive",
-    >= 10 and < 100       => "medium positive",
-    >= 100                 => "large positive"
+    { TierLevel: "Gold",   YearsActive: >= 5 } => "Loyal Gold",
+    { TierLevel: "Gold"                       } => "New Gold",
+    { TierLevel: "Silver", YearsActive: >= 3  } => "Established Silver",
+    { IsActive: false }                          => "Inactive",
+    _                                            => "Standard"
 };
 ```
 
-### Property Pattern
+### Positional Patterns — Destructure Records and Tuples
+
+When a type supports deconstruction (records do automatically), you can
+match on the positions of deconstructed values:
 
 ```csharp
-record Address(string City, string Country, string PostalCode);
-record Person(string Name, int Age, Address Address);
+public record Point(int X, int Y);
 
-string Classify(Person p) => p switch
+string QuadrantOf(Point p) => p switch
 {
-    { Age: < 18 }                               => "minor",
-    { Age: >= 18, Address.Country: "DE" }       => "German adult",
-    { Age: >= 18, Address.City: "Berlin" }      => "Berliner adult",
-    { Name: "Alice", Age: >= 30 }              => "Alice in her 30s+",
-    _                                           => "other"
-};
-
-// Nested property pattern
-bool IsLocalGerman(Person p) => p is
-{
-    Address: { Country: "DE", City: "Berlin" or "Hamburg" or "Munich" },
-    Age: >= 18
+    (0, 0)     => "Origin",
+    (> 0, > 0) => "Quadrant I",
+    (< 0, > 0) => "Quadrant II",
+    (< 0, < 0) => "Quadrant III",
+    (> 0, < 0) => "Quadrant IV",
+    _          => "On an axis"
 };
 ```
 
-### Positional Pattern (Deconstruct)
-
-Works with records, tuples, and types that have `Deconstruct`:
+### Relational and Logical Patterns
 
 ```csharp
-public record Point(double X, double Y);
-
-string Quadrant(Point p) => p switch
+// Relational patterns: <, >, <=, >=
+string RateTemp(double celsius) => celsius switch
 {
-    ( > 0,  > 0) => "Q1",
-    ( < 0,  > 0) => "Q2",
-    ( < 0,  < 0) => "Q3",
-    ( > 0,  < 0) => "Q4",
-    (0, 0)       => "origin",
-    (0, _)       => "y-axis",
-    (_, 0)       => "x-axis",
+    < 0    => "Freezing",
+    < 10   => "Cold",
+    < 20   => "Cool",
+    < 30   => "Warm",
+    < 40   => "Hot",
+    _      => "Extreme"
 };
 
-// With named elements
-string Describe((int x, int y) point) => point switch
+// Logical patterns: and, or, not
+bool IsWeekday(DayOfWeek day) => day is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
+
+// Combined
+string Category(int score) => score switch
 {
-    (0, 0)          => "origin",
-    (var x, 0)      => $"on x-axis at {x}",
-    (0, var y)      => $"on y-axis at {y}",
-    (var x, var y)  => $"at ({x}, {y})"
+    >= 90            => "A",
+    >= 80 and < 90   => "B",
+    >= 70 and < 80   => "C",
+    >= 60 and < 70   => "D",
+    _                => "F"
 };
 ```
 
-### List Pattern (C# 11+)
+### List Patterns (C# 11) — Match on Sequence Structure
 
 ```csharp
-int[] arr = [1, 2, 3, 4, 5];
-
-bool matched = arr switch
+// Match arrays and lists by structure
+string Describe(int[] numbers) => numbers switch
 {
-    []                  => true,   // empty
-    [1, 2, ..]         => true,   // starts with 1, 2
-    [.., 4, 5]         => true,   // ends with 4, 5
-    [1, .. var mid, 5] => true,   // capture middle
-    [var first, ..]    => true,   // capture first element
-    _                   => false
-};
-
-// Practical: routing
-string Route(string[] segments) => segments switch
-{
-    ["api", "v1", "users"]            => "list users",
-    ["api", "v1", "users", var id]    => $"get user {id}",
-    ["api", "v1", "products", ..]     => "product endpoints",
-    ["api", var version, ..]          => $"api version {version}",
-    _                                 => "not found"
-};
-
-// Pattern match on spans (C# 11+)
-bool StartsWithHttp(ReadOnlySpan<char> url) => url switch
-{
-    ['h', 't', 't', 'p', 's', ':',..] => true,
-    ['h', 't', 't', 'p', ':',..] => true,
-    _ => false
+    []           => "empty",
+    [var x]      => $"single element: {x}",
+    [var x, var y] => $"two elements: {x} and {y}",
+    [0, ..]      => "starts with zero",
+    [.., 0]      => "ends with zero",
+    [var first, .., var last] => $"starts with {first}, ends with {last}"
 };
 ```
 
-### var Pattern
+### Why Exhaustiveness Matters
+
+The switch expression (unlike the switch statement) is an *expression* —
+it must return a value for every possible input. The compiler warns you
+if your patterns do not cover all cases:
 
 ```csharp
-// var always matches, captures the value
-string Inspect(object o) => o switch
+// Compiler warning CS8509 if any enum value is not covered
+string StatusLabel(OrderStatus status) => status switch
 {
-    int n when n % 2 == 0 => $"even int: {n}",
-    string { Length: var len } when len > 10 => "long string",
-    var x => $"other: {x}"
-};
-
-// Useful for side-effects in switch
-void Log(object o)
-{
-    if (o is var x and not null)
-    {
-        Console.WriteLine(x);
-    }
-}
-```
-
-### Combining All Patterns — Real-World Example
-
-```csharp
-// Shape hierarchy
-abstract record Shape;
-record Circle(double Radius) : Shape;
-record Rectangle(double Width, double Height) : Shape;
-record Triangle(double Base, double Height) : Shape;
-
-double Area(Shape shape) => shape switch
-{
-    Circle { Radius: var r }                         => Math.PI * r * r,
-    Rectangle { Width: var w, Height: var h }        => w * h,
-    Triangle { Base: var b, Height: var h }          => 0.5 * b * h,
-    null                                              => throw new ArgumentNullException(nameof(shape)),
-    _                                                 => throw new NotSupportedException($"Unknown shape: {shape}")
-};
-
-string Classify(Shape shape) => shape switch
-{
-    Circle { Radius: 0 }           => "degenerate circle",
-    Circle { Radius: < 1 }        => "small circle",
-    Circle { Radius: >= 1 and < 10 } => "medium circle",
-    Circle                         => "large circle",
-    Rectangle { Width: var w, Height: var h } when w == h => "square",
-    Rectangle                      => "rectangle",
-    Triangle { Base: var b, Height: var h } when b == h   => "isoceles-ish triangle",
-    Triangle                       => "triangle",
-    _                              => "unknown"
+    OrderStatus.Pending    => "Awaiting payment",
+    OrderStatus.Processing => "Being prepared",
+    OrderStatus.Shipped    => "On its way",
+    OrderStatus.Delivered  => "Delivered",
+    // Compiler: CS8509 — switch expression does not handle all possible values
+    // of 'OrderStatus'. Add 'OrderStatus.Cancelled' or a discard pattern.
 };
 ```
+
+This is enormously valuable when you add a new enum member. Every switch
+expression that covers the enum will produce a compiler warning, pointing
+you to every place that needs updating.
 
 ---
 
-## 3.4 Exception Handling
+## 3.4 Exception Handling — Communicate Failure Appropriately
+
+Exceptions exist to communicate *unexpected* failures — situations that
+violate the contract of a method. They should not be used for expected
+outcomes like "user not found" or "validation failed". See Ch 6 §6.3
+for the deeper principle (Errors Are Values).
 
 ```csharp
-// Basic try/catch/finally
 try
 {
-    var result = RiskyOperation();
+    var result = await ProcessOrderAsync(orderId, ct);
     return result;
 }
-catch (FileNotFoundException ex)
+catch (OrderNotFoundException ex)
 {
-    _logger.LogError(ex, "File not found: {Path}", ex.FileName);
-    throw;  // re-throw preserving stack trace
+    // Specific exception first — ordered from most specific to least specific
+    _logger.LogWarning("Order {Id} not found: {Message}", orderId, ex.Message);
+    return NotFound();
 }
-catch (IOException ex) when (ex.HResult == -2147024784) // specific HResult
+catch (ValidationException ex)
 {
-    return null;
+    return BadRequest(ex.Errors);
 }
-catch (OperationCanceledException)
+catch (TimeoutException ex)
 {
-    // Don't log cancelled operations as errors
-    return null;
+    _logger.LogError(ex, "Timeout processing order {Id}", orderId);
+    return StatusCode(503, "Service temporarily unavailable");
 }
 catch (Exception ex)
 {
-    _logger.LogError(ex, "Unexpected error");
-    throw new ServiceException("Operation failed", ex);  // wrapping
+    // Only catch the base Exception to log and rethrow
+    // Never swallow it silently
+    _logger.LogError(ex, "Unexpected error processing order {Id}", orderId);
+    throw;  // 'throw' (not 'throw ex') preserves the original stack trace
 }
 finally
 {
-    Cleanup(); // always runs, even on exception or return
+    // Runs regardless of success or failure — use for cleanup
+    // But prefer 'using' statements (§3.5) for IDisposable cleanup
+    _metrics.RecordAttempt();
 }
 ```
 
-### Exception Filters (`when`)
+### Exception Filters — `when`
+
+`when` lets you narrow a catch to only handle exceptions that meet a
+condition, without catching and rethrowing:
 
 ```csharp
-catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)
+catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable)
 {
-    await Task.Delay(TimeSpan.FromSeconds(1));
-    return await RetryAsync();
-}
-
-catch (SqlException ex) when (ex.Number == 1205)  // deadlock
-{
-    // retry
-}
-
-// Filter with side effect (logging without catching)
-catch (Exception ex) when (Log(ex) && false) { }
-// Log(ex) runs, but false means the filter never matches — exception propagates
-```
-
-### Custom Exceptions
-
-```csharp
-// Base pattern for custom exceptions
-public class OrderException : Exception
-{
-    public string OrderId { get; }
-
-    public OrderException(string orderId, string message)
-        : base(message)
-    {
-        OrderId = orderId;
-    }
-
-    public OrderException(string orderId, string message, Exception inner)
-        : base(message, inner)
-    {
-        OrderId = orderId;
-    }
-}
-
-public class OrderNotFoundException : OrderException
-{
-    public OrderNotFoundException(string orderId)
-        : base(orderId, $"Order '{orderId}' was not found.") { }
-}
-
-public class InsufficientStockException : OrderException
-{
-    public string Sku { get; }
-    public int Requested { get; }
-    public int Available { get; }
-
-    public InsufficientStockException(string orderId, string sku, int requested, int available)
-        : base(orderId, $"Insufficient stock for SKU '{sku}': requested {requested}, available {available}.")
-    {
-        Sku = sku;
-        Requested = requested;
-        Available = available;
-    }
+    // Only handles 503, not 404 or 401
+    await Task.Delay(TimeSpan.FromSeconds(5), ct);
+    throw;  // rethrow to let the retry policy handle it
 }
 ```
 
-### Using `ExceptionDispatchInfo`
+### Custom Exceptions — When and How
+
+Create a custom exception when callers need to distinguish your failure
+mode from all other failures:
 
 ```csharp
-// Capture and re-throw without losing original stack trace
-var edi = ExceptionDispatchInfo.Capture(ex);
-await DoCleanupAsync();
-edi.Throw(); // re-throws with original stack trace
+public class InsufficientFundsException(decimal required, decimal available)
+    : Exception($"Need {required:C} but only {available:C} available")
+{
+    public decimal Required  { get; } = required;
+    public decimal Available { get; } = available;
+}
+
+// Caller can catch specifically
+catch (InsufficientFundsException ex)
+{
+    ShowFundsError(ex.Required, ex.Available);
+}
 ```
 
 ---
 
-## 3.5 `using` Statement and `IDisposable`
+## 3.5 `using` and `IDisposable` — Deterministic Resource Cleanup
+
+The garbage collector handles memory. It does not handle *other resources*:
+file handles, database connections, network sockets, native memory. These
+resources must be released explicitly and promptly, or you leak them.
+
+`IDisposable` is the contract: a type that implements it has a `Dispose()`
+method that releases its unmanaged resources. The `using` statement
+guarantees `Dispose` is called when the variable goes out of scope, even
+if an exception is thrown.
 
 ```csharp
-// Classic using statement
-using (var conn = new SqlConnection(connectionString))
+// Classic using block
+using (var conn = new SqliteConnection(connectionString))
 {
     conn.Open();
-    // conn.Dispose() called automatically even on exception
-}
+    // ... use conn ...
+}  // conn.Dispose() called here, even if an exception was thrown inside
 
-// using declaration (C# 8+) — disposed at end of enclosing scope
-using var conn = new SqlConnection(connectionString);
-conn.Open();
-// conn.Dispose() called when method returns
-
-// Multiple resources
-using var conn = new SqlConnection(connectionString);
-using var cmd  = conn.CreateCommand();
-using var reader = cmd.ExecuteReader();
-
-// await using for IAsyncDisposable
-await using var context = new AppDbContext(options);
-await using var transaction = await context.Database.BeginTransactionAsync();
+// Modern using declaration (C# 8+) — 'using' without braces
+// Dispose is called at the end of the enclosing scope (method, block)
+using var conn2 = new SqliteConnection(connectionString);
+conn2.Open();
+// ... use conn2 ...
+// conn2.Dispose() called when method returns or throws
 ```
 
-### Implementing `IDisposable`
-
-```csharp
-public class FileProcessor : IDisposable, IAsyncDisposable
-{
-    private FileStream? _stream;
-    private bool _disposed;
-
-    public FileProcessor(string path)
-    {
-        _stream = new FileStream(path, FileMode.Open, FileAccess.Read);
-    }
-
-    public void Process() { /* use _stream */ }
-
-    // IDisposable
-    public void Dispose()
-    {
-        Dispose(disposing: true);
-        GC.SuppressFinalize(this);
-    }
-
-    protected virtual void Dispose(bool disposing)
-    {
-        if (_disposed) return;
-        if (disposing)
-        {
-            _stream?.Dispose();
-            _stream = null;
-        }
-        _disposed = true;
-    }
-
-    // IAsyncDisposable
-    public async ValueTask DisposeAsync()
-    {
-        if (_stream is not null)
-        {
-            await _stream.DisposeAsync();
-            _stream = null;
-        }
-        GC.SuppressFinalize(this);
-    }
-}
-```
+The `using` declaration (without braces) is preferred for its brevity
+when the resource should live for the duration of the current method.
+Use the block form when you need to release the resource before the
+method ends. See Chapter 26 for the full `IDisposable` implementation
+pattern and how the finaliser interacts with it.
 
 ---
 
-## 3.6 Iteration and `yield return`
+## 3.6 Iteration — `foreach`, `yield`, and Lazy Sequences
+
+`foreach` works on any type that implements `IEnumerable<T>` or has a
+compatible `GetEnumerator()` method. This includes arrays, lists,
+dictionaries, LINQ queries, and custom types.
+
+### `yield return` — Generating Sequences Lazily
+
+`yield return` creates an *iterator method* — a method that produces a
+sequence one element at a time without materialising the whole sequence
+into memory at once. The method body is suspended after each `yield`
+and resumed when the next element is requested.
 
 ```csharp
-// Generator method — lazy evaluation
-public static IEnumerable<int> Fibonacci()
+// Without yield: materialises all results into memory before returning
+public IEnumerable<string> ReadAllLines(string path) =>
+    File.ReadAllLines(path);  // reads entire file, then returns
+
+// With yield: reads and produces one line at a time — works on arbitrarily large files
+public IEnumerable<string> ReadLines(string path)
+{
+    using var reader = new StreamReader(path);
+    while (!reader.EndOfStream)
+        yield return reader.ReadLine()!;
+}
+// File is read lazily: only the lines actually consumed are ever in memory
+
+// Yield works with any condition
+public IEnumerable<int> Fibonacci()
 {
     int a = 0, b = 1;
     while (true)
     {
         yield return a;
-        (a, b) = (b, a + b);
+        (a, b) = (b, a + b);  // indefinitely — caller controls how many they take
     }
 }
 
-// Take first 10
-var fibs = Fibonacci().Take(10).ToList();
-// [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
-
-// yield break
-public static IEnumerable<string> ReadLines(string path)
-{
-    if (!File.Exists(path)) yield break;  // stop iteration early
-    using var reader = new StreamReader(path);
-    string? line;
-    while ((line = reader.ReadLine()) is not null)
-        yield return line;
-}
-
-// Async generators (C# 8+)
-public static async IAsyncEnumerable<int> GetNumbersAsync(
-    [EnumeratorCancellation] CancellationToken ct = default)
-{
-    for (int i = 0; i < 100; i++)
-    {
-        await Task.Delay(10, ct);
-        yield return i;
-    }
-}
-
-// Consuming async enumerable
-await foreach (var n in GetNumbersAsync(cts.Token))
-{
-    Console.WriteLine(n);
-}
+var first10 = Fibonacci().Take(10).ToList();
 ```
+
+`yield` pairs naturally with LINQ (Chapter 7) because LINQ is itself
+lazy — it processes one element at a time through a chain of operators.
 
 ---
 
-## 3.7 goto (and When to Avoid It)
+## 3.7 Connecting Control Flow to the Rest of the Book
 
-```csharp
-// goto is valid C# but almost never needed. Exception: break from nested loops
-for (int i = 0; i < 10; i++)
-{
-    for (int j = 0; j < 10; j++)
-    {
-        if (i + j > 10) goto done;  // only legitimate use
-    }
-}
-done:
-Console.WriteLine("done");
-
-// Better: extract to method and use return
-void Search()
-{
-    for (int i = 0; i < 10; i++)
-        for (int j = 0; j < 10; j++)
-            if (i + j > 10) return;
-}
-```
-
-> **Rider tip:** Use *Navigate → Next/Prev highlighted error* (`F2` / `Shift+F2`) to jump between pattern match exhaustiveness warnings. Rider highlights unhandled cases in switch expressions in red.
-
-> **VS tip:** *Ctrl+.* on an incomplete switch expression offers *"Add missing cases"* — it generates stubs for all unhandled enum values or type hierarchy members.
-
+Pattern matching built on Ch 2's type system:
+- **Ch 6 §6.5 (Totality)** — exhaustive pattern matching ensures you
+  handle every case, not just the common one.
+- **Ch 7 (LINQ)** — `Where`, `Select`, `GroupBy` are all control flow
+  over sequences, expressed functionally.
+- **Ch 8 (Async)** — `await` in a `while` loop, `foreach` over
+  `IAsyncEnumerable<T>`, and cancellation all follow control flow rules.
+- **Ch 14 (ASP.NET Core)** — route matching uses pattern-like concepts;
+  middleware is a chain of conditional delegates.
+- **Ch 26 (Memory)** — `using` and `IDisposable` are the most important
+  control flow construct for resource management.

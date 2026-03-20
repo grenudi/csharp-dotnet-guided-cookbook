@@ -1,429 +1,230 @@
 # Chapter 13 — Networking: HttpClient, gRPC, WebSockets & QUIC
 
-## 13.1 HttpClient — Best Practices
+> Almost every modern application is a networked application. Whether
+> it is calling a third-party API, talking to its own microservices, or
+> pushing real-time updates to clients, the code that crosses process
+> boundaries is critical to get right. This chapter covers the four main
+> networking primitives in .NET and explains when to reach for each one.
 
-### The Socket Exhaustion Problem
+*Building on:* Ch 8 (async/await — all networking is async), Ch 12
+(streams — HTTP response bodies are streams), Ch 10 (DI — HttpClient
+should be registered via IHttpClientFactory, not newed directly)
+
+---
+
+## 13.1 HttpClient — The Right Way
+
+`HttpClient` is the BCL type for making HTTP requests. It is deceptively
+simple but has serious misuse patterns that cause production problems.
+
+### The Two Common Mistakes
+
+**Mistake 1 — Creating a new `HttpClient` per request:**
 
 ```csharp
-// WRONG — creates new connections each call, exhausts sockets
-public async Task<string> FetchAsync(string url)
+// WRONG: new HttpClient every time
+public async Task<string> GetDataAsync(string url)
 {
-    using var client = new HttpClient(); // DO NOT do this in production!
+    using var client = new HttpClient();   // creates new TCP connection every call
     return await client.GetStringAsync(url);
-}
-
-// BETTER — single HttpClient (but doesn't rotate DNS)
-private static readonly HttpClient _client = new();
-
-// BEST — IHttpClientFactory (handles lifecycle, rotation, resilience)
-// Register in DI:
-services.AddHttpClient();
-
-// Inject:
-public class MyService
-{
-    private readonly HttpClient _http;
-    public MyService(IHttpClientFactory factory)
-        => _http = factory.CreateClient();
 }
 ```
 
-### Named Clients
+`HttpClient` implements `IDisposable` which makes it look like it should
+be in a `using` statement. But disposing it does not immediately close
+sockets — the underlying `HttpClientHandler` exhausts your available
+TCP ports under high load (socket exhaustion).
+
+**Mistake 2 — A single static instance shared forever:**
+
+```csharp
+// WRONG: static singleton ignores DNS changes
+private static readonly HttpClient _client = new();
+```
+
+A long-lived single instance respects DNS TTLs but ignores DNS updates.
+If the target server changes IP, your static client never discovers it.
+
+### The Solution: `IHttpClientFactory`
+
+`IHttpClientFactory` manages a pool of `HttpClientHandler` instances with
+a configurable lifetime. It reuses handlers (avoiding socket exhaustion)
+and cycles them (respecting DNS changes):
 
 ```csharp
 // Registration
-builder.Services.AddHttpClient("github", client =>
+builder.Services.AddHttpClient<IGitHubClient, GitHubClient>(client =>
 {
-    client.BaseAddress = new Uri("https://api.github.com/");
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("MyApp/1.0");
-    client.DefaultRequestHeaders.Authorization =
-        new AuthenticationHeaderValue("Bearer", "token");
+    client.BaseAddress = new Uri("https://api.github.com");
+    client.DefaultRequestHeaders.Add("User-Agent", "MyApp/1.0");
     client.Timeout = TimeSpan.FromSeconds(30);
-});
+})
+.AddStandardResilienceHandler();   // adds retry, circuit breaker, timeout
 
-// Inject
-public class GithubService
+// Typed client: HttpClient is injected, pre-configured
+public class GitHubClient(HttpClient http)
 {
-    private readonly HttpClient _http;
-
-    public GithubService(IHttpClientFactory factory)
-        => _http = factory.CreateClient("github");
-
-    public async Task<JsonDocument?> GetRepoAsync(string owner, string repo, CancellationToken ct)
+    public async Task<Repository?> GetRepoAsync(
+        string owner, string repo, CancellationToken ct)
     {
-        var response = await _http.GetAsync($"repos/{owner}/{repo}", ct);
+        var response = await http.GetAsync($"/repos/{owner}/{repo}", ct);
         response.EnsureSuccessStatusCode();
-        return await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        return await response.Content.ReadFromJsonAsync<Repository>(ct);
     }
 }
-```
-
-### Typed Clients
-
-```csharp
-// Define typed client
-public class WeatherClient
-{
-    private readonly HttpClient _http;
-
-    public WeatherClient(HttpClient http)
-    {
-        _http = http;
-    }
-
-    public async Task<WeatherForecast[]> GetForecastAsync(string city, CancellationToken ct = default)
-    {
-        var response = await _http.GetAsync($"forecast?city={Uri.EscapeDataString(city)}", ct);
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<WeatherForecast[]>(ct)
-               ?? [];
-    }
-}
-
-// Register
-builder.Services.AddHttpClient<WeatherClient>(client =>
-{
-    client.BaseAddress = new Uri("https://api.openweathermap.org/");
-});
-
-// Inject directly
-public class WeatherPage
-{
-    public WeatherPage(WeatherClient weather) { ... }
-}
-```
-
-### HttpMessageHandler and Resilience
-
-```csharp
-// Add Polly (Microsoft.Extensions.Http.Polly) for retry, circuit breaker
-builder.Services.AddHttpClient<ApiClient>()
-    .AddTransientHttpErrorPolicy(p =>
-        p.WaitAndRetryAsync(3, retry => TimeSpan.FromSeconds(Math.Pow(2, retry))))
-    .AddTransientHttpErrorPolicy(p =>
-        p.CircuitBreakerAsync(5, TimeSpan.FromSeconds(30)));
-
-// Or with the new Resilience package (NET 8+, Microsoft.Extensions.Http.Resilience)
-builder.Services.AddHttpClient<ApiClient>()
-    .AddStandardResilienceHandler(); // retry + circuit breaker + timeout + hedging
 ```
 
 ### Making Requests
 
 ```csharp
-// GET
-var response = await _http.GetAsync(url, ct);
-response.EnsureSuccessStatusCode();
-string text = await response.Content.ReadAsStringAsync(ct);
-var obj = await response.Content.ReadFromJsonAsync<MyType>(ct);
+// GET — most common
+var response = await http.GetAsync("/api/users", ct);
+response.EnsureSuccessStatusCode();   // throws HttpRequestException on non-2xx
+var users = await response.Content.ReadFromJsonAsync<List<User>>(ct);
 
-// GET with query params
-var builder = new UriBuilder("https://api.example.com/users");
-var query = System.Web.HttpUtility.ParseQueryString("");
-query["page"] = "1";
-query["limit"] = "20";
-query["search"] = "alice";
-builder.Query = query.ToString();
-var result = await _http.GetFromJsonAsync<UserList>(builder.Uri, ct);
-
-// POST JSON
-var body = new { Name = "Alice", Age = 30 };
-var response2 = await _http.PostAsJsonAsync("/users", body, ct);
-response2.EnsureSuccessStatusCode();
-var created = await response2.Content.ReadFromJsonAsync<User>(ct);
-
-// PUT / PATCH / DELETE
-await _http.PutAsJsonAsync($"/users/{id}", updatedUser, ct);
-await _http.DeleteAsync($"/users/{id}", ct);
-
-// Multipart form data (file upload)
-using var form = new MultipartFormDataContent();
-form.Add(new StringContent("Alice"), "name");
-form.Add(new ByteArrayContent(fileBytes), "file", "photo.jpg");
-await _http.PostAsync("/upload", form, ct);
-
-// Custom request
-using var req = new HttpRequestMessage(HttpMethod.Patch, $"/users/{id}")
+// POST with JSON body
+var created = await http.PostAsJsonAsync("/api/orders", new CreateOrderRequest
 {
-    Content = JsonContent.Create(patch, options: JsonOptions.Web),
-    Headers = { { "X-Custom-Header", "value" } }
-};
-var resp = await _http.SendAsync(req, ct);
+    CustomerId = "C001",
+    Items = [new() { ProductId = "P01", Quantity = 2 }]
+}, ct);
 
-// Streaming response (large download)
-using var response3 = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-await using var stream = await response3.Content.ReadAsStreamAsync(ct);
-await using var fs = new FileStream("download.bin", FileMode.Create);
-await stream.CopyToAsync(fs, ct);
+// PUT, PATCH, DELETE
+await http.PutAsJsonAsync("/api/orders/123", updateRequest, ct);
+await http.DeleteAsync("/api/orders/123", ct);
+
+// Raw request with headers
+using var request = new HttpRequestMessage(HttpMethod.Get, "/api/data");
+request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+var raw = await http.SendAsync(request, ct);
+```
+
+### Resilience — Retry, Circuit Breaker, Timeout
+
+```csharp
+// Microsoft.Extensions.Http.Resilience (recommended)
+builder.Services.AddHttpClient<IPaymentClient, StripePaymentClient>()
+    .AddStandardResilienceHandler(opts =>
+    {
+        opts.Retry.MaxRetryAttempts = 3;
+        opts.Retry.Delay = TimeSpan.FromSeconds(1);
+        opts.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(30);
+        opts.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(60);
+    });
 ```
 
 ---
 
-## 13.2 gRPC
+## 13.2 gRPC — High-Performance Service Communication
 
-### Project Setup
+gRPC is a Remote Procedure Call framework built on HTTP/2 (multiplexed,
+bi-directional) and Protocol Buffers (compact binary serialisation). It
+is faster than REST/JSON for service-to-service communication and
+provides strongly-typed generated clients.
 
-```xml
-<!-- MyGrpc.csproj -->
-<Project Sdk="Microsoft.NET.Sdk.Web">
-  <ItemGroup>
-    <PackageReference Include="Grpc.AspNetCore" Version="2.65.0" />
-    <PackageReference Include="Grpc.Tools" Version="2.65.0" PrivateAssets="all" />
-  </ItemGroup>
-  <ItemGroup>
-    <Protobuf Include="Protos/**/*.proto" GrpcServices="Server" />
-  </ItemGroup>
-</Project>
+### When to Use gRPC vs REST
 
-<!-- Client project -->
-<ItemGroup>
-  <PackageReference Include="Grpc.Net.Client" Version="2.65.0" />
-  <PackageReference Include="Google.Protobuf" Version="3.28.0" />
-  <PackageReference Include="Grpc.Tools" Version="2.65.0" PrivateAssets="all" />
-</ItemGroup>
-<ItemGroup>
-  <Protobuf Include="Protos/**/*.proto" GrpcServices="Client" />
-</ItemGroup>
-```
+| Situation | Prefer |
+|---|---|
+| Service-to-service internal communication | gRPC |
+| Browser clients | REST (or gRPC-Web for browser support) |
+| Public API | REST (familiar, toolable with Swagger) |
+| Streaming data (server push) | gRPC server streaming |
+| Bidirectional real-time | gRPC bidirectional streaming |
+| Performance-critical high-throughput | gRPC |
 
-### Proto Definition
+### Defining a Service in Proto
+
+The `.proto` file is the single source of truth. The `dotnet-grpc` tool
+generates both server stubs and client code from it:
 
 ```protobuf
-// Protos/sync.proto
+// protos/orders.proto
 syntax = "proto3";
-option csharp_namespace = "SyncDot.Grpc";
+option csharp_namespace = "MyApp.Orders.Grpc";
 
-package sync;
+service OrderService {
+  // Unary: one request, one response (like REST)
+  rpc GetOrder      (GetOrderRequest)      returns (OrderResponse);
+  rpc CreateOrder   (CreateOrderRequest)   returns (OrderResponse);
 
-service SyncService {
-  rpc GetStatus (StatusRequest)              returns (StatusResponse);
-  rpc ListFiles (ListFilesRequest)           returns (stream FileEntry);
-  rpc SyncFiles (stream FileChunk)           returns (SyncResult);
-  rpc WatchChanges (WatchRequest)            returns (stream ChangeEvent);
+  // Server streaming: one request, many responses (feed of results)
+  rpc ListOrders    (ListOrdersRequest)    returns (stream OrderResponse);
+
+  // Client streaming: many requests, one response (batch upload)
+  rpc BulkCreate    (stream CreateOrderRequest) returns (BulkCreateResult);
+
+  // Bidirectional streaming: many requests AND many responses
+  rpc OrderUpdates  (stream SubscribeRequest) returns (stream OrderUpdate);
 }
 
-message StatusRequest {}
-message StatusResponse {
-  string node_id = 1;
-  int64 file_count = 2;
-  int64 total_bytes = 3;
-  bool is_syncing = 4;
-}
-
-message ListFilesRequest {
-  string directory = 1;
-}
-
-message FileEntry {
-  string path = 1;
-  int64 size = 2;
-  int64 modified_at = 3;  // Unix timestamp
-  string hash = 4;
-}
-
-message FileChunk {
-  string path = 1;
-  bytes data = 2;
-  int32 chunk_index = 3;
-  bool is_last = 4;
-}
-
-message SyncResult {
-  int32 files_synced = 1;
-  int32 files_failed = 2;
-  repeated string errors = 3;
-}
-
-message WatchRequest {
-  repeated string directories = 1;
-}
-
-message ChangeEvent {
-  enum ChangeType { CREATED = 0; MODIFIED = 1; DELETED = 2; RENAMED = 3; }
-  ChangeType type = 1;
-  string path = 2;
-  string old_path = 3;  // for renames
-  int64 timestamp = 4;
-}
+message GetOrderRequest    { string id = 1; }
+message OrderResponse      { string id = 1; string customer = 2; double total = 3; }
+message ListOrdersRequest  { string customer_id = 1; int32 page = 2; }
+message BulkCreateResult   { int32 created = 1; repeated string errors = 2; }
 ```
 
-### gRPC Server Implementation
-
 ```csharp
-using Grpc.Core;
-using SyncDot.Grpc;
-
-public class SyncServiceImpl : SyncService.SyncServiceBase
+// Server implementation
+public class OrderGrpcService(IOrderRepository repo) : OrderService.OrderServiceBase
 {
-    private readonly IFileSystem _fs;
-    private readonly ILogger<SyncServiceImpl> _logger;
-
-    public SyncServiceImpl(IFileSystem fs, ILogger<SyncServiceImpl> logger)
+    public override async Task<OrderResponse> GetOrder(
+        GetOrderRequest request, ServerCallContext context)
     {
-        _fs = fs;
-        _logger = logger;
+        var order = await repo.GetByIdAsync(request.Id, context.CancellationToken);
+        if (order is null)
+            throw new RpcException(new Status(StatusCode.NotFound, $"Order {request.Id} not found"));
+
+        return new OrderResponse { Id = order.Id, Customer = order.Customer, Total = (double)order.Total };
     }
 
-    // Unary
-    public override Task<StatusResponse> GetStatus(StatusRequest request, ServerCallContext context)
-    {
-        return Task.FromResult(new StatusResponse
-        {
-            NodeId     = _fs.NodeId,
-            FileCount  = _fs.FileCount,
-            TotalBytes = _fs.TotalBytes,
-            IsSyncing  = _fs.IsSyncing
-        });
-    }
-
-    // Server streaming
-    public override async Task ListFiles(ListFilesRequest request,
-        IServerStreamWriter<FileEntry> responseStream,
+    public override async Task ListOrders(
+        ListOrdersRequest request,
+        IServerStreamWriter<OrderResponse> stream,
         ServerCallContext context)
     {
-        await foreach (var entry in _fs.EnumerateAsync(request.Directory, context.CancellationToken))
+        await foreach (var order in repo.GetByCustomerAsync(request.CustomerId, context.CancellationToken))
         {
-            await responseStream.WriteAsync(new FileEntry
+            await stream.WriteAsync(new OrderResponse
             {
-                Path       = entry.Path,
-                Size       = entry.Size,
-                ModifiedAt = entry.ModifiedAt.ToUnixTimeSeconds(),
-                Hash       = entry.Hash ?? ""
-            });
-        }
-    }
-
-    // Client streaming
-    public override async Task<SyncResult> SyncFiles(
-        IAsyncStreamReader<FileChunk> requestStream,
-        ServerCallContext context)
-    {
-        int synced = 0, failed = 0;
-        var errors = new List<string>();
-        var buffers = new Dictionary<string, List<FileChunk>>();
-
-        await foreach (var chunk in requestStream.ReadAllAsync(context.CancellationToken))
-        {
-            if (!buffers.ContainsKey(chunk.Path))
-                buffers[chunk.Path] = new();
-            buffers[chunk.Path].Add(chunk);
-
-            if (chunk.IsLast)
-            {
-                try
-                {
-                    var allChunks = buffers[chunk.Path].OrderBy(c => c.ChunkIndex);
-                    await _fs.WriteFileAsync(chunk.Path, allChunks.SelectMany(c => c.Data.ToByteArray()));
-                    buffers.Remove(chunk.Path);
-                    synced++;
-                }
-                catch (Exception ex)
-                {
-                    errors.Add($"{chunk.Path}: {ex.Message}");
-                    failed++;
-                }
-            }
-        }
-
-        return new SyncResult { FilesSynced = synced, FilesFailed = failed, Errors = { errors } };
-    }
-
-    // Bidirectional streaming
-    public override async Task WatchChanges(
-        WatchRequest request,
-        IServerStreamWriter<ChangeEvent> responseStream,
-        ServerCallContext context)
-    {
-        var ct = context.CancellationToken;
-        await foreach (var change in _fs.WatchAsync(request.Directories, ct))
-        {
-            await responseStream.WriteAsync(new ChangeEvent
-            {
-                Type      = (ChangeEvent.Types.ChangeType)change.Type,
-                Path      = change.Path,
-                OldPath   = change.OldPath ?? "",
-                Timestamp = change.Timestamp.ToUnixTimeSeconds()
+                Id = order.Id, Customer = order.Customer, Total = (double)order.Total
             });
         }
     }
 }
 ```
 
-### gRPC Server Setup
-
 ```csharp
-// Program.cs
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc(opts =>
-{
-    opts.MaxReceiveMessageSize = 16 * 1024 * 1024; // 16MB
-    opts.MaxSendMessageSize    = 16 * 1024 * 1024;
-    opts.EnableDetailedErrors  = builder.Environment.IsDevelopment();
-});
-
-// Unix socket (for local IPC — used by SyncDot)
-builder.WebHost.ConfigureKestrel(opts =>
-{
-    opts.ListenUnixSocket("/run/syncdot/syncdot.sock", listen =>
-    {
-        listen.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2;
-    });
-    // Or TCP:
-    opts.ListenAnyIP(50051, listen => listen.Protocols = HttpProtocols.Http2);
-});
-
-var app = builder.Build();
-app.MapGrpcService<SyncServiceImpl>();
-app.Run();
-```
-
-### gRPC Client
-
-```csharp
-// Connect to Unix socket
-var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
-{
-    HttpHandler = new SocketsHttpHandler
-    {
-        ConnectCallback = async (ctx, ct) =>
-        {
-            var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint("/run/syncdot/syncdot.sock"), ct);
-            return new NetworkStream(socket, ownsSocket: true);
-        }
-    }
-});
-
-var client = new SyncService.SyncServiceClient(channel);
+// Client
+var channel = GrpcChannel.ForAddress("https://orders.internal:5001");
+var client  = new OrderService.OrderServiceClient(channel);
 
 // Unary call
-var status = await client.GetStatusAsync(new StatusRequest());
-Console.WriteLine($"Node: {status.NodeId}, Files: {status.FileCount}");
+var order = await client.GetOrderAsync(new GetOrderRequest { Id = "ORD001" });
 
-// Server streaming
-using var stream = client.ListFiles(new ListFilesRequest { Directory = "/" });
-await foreach (var entry in stream.ResponseStream.ReadAllAsync())
-    Console.WriteLine($"{entry.Path} ({entry.Size} bytes)");
-
-// Client streaming
-using var sync = client.SyncFiles();
-foreach (var chunk in GetChunks(files))
-    await sync.RequestStream.WriteAsync(chunk);
-await sync.RequestStream.CompleteAsync();
-var result = await sync.ResponseAsync;
-
-// Bidirectional streaming
-using var watch = client.WatchChanges(new WatchRequest { Directories = { "/home/user/sync" } });
-await foreach (var change in watch.ResponseStream.ReadAllAsync(ct))
-    Console.WriteLine($"[{change.Type}] {change.Path}");
+// Server streaming: process results as they arrive
+using var stream = client.ListOrders(new ListOrdersRequest { CustomerId = "C001" });
+await foreach (var o in stream.ResponseStream.ReadAllAsync(ct))
+    Console.WriteLine($"Order: {o.Id} — {o.Total:C}");
 ```
 
 ---
 
-## 13.3 WebSockets
+## 13.3 WebSockets — Full-Duplex Text and Binary
+
+WebSockets are a persistent, full-duplex connection between client and
+server. Unlike HTTP (request/response), either side can send data at any
+time. They are ideal for: chat, live notifications, collaborative
+editing, game state updates.
+
+For most real-time use cases, SignalR (Chapter 31) is a better choice —
+it provides automatic reconnection, group management, and falls back to
+long-polling for clients that do not support WebSockets. Use raw
+WebSockets only when you need the maximum control or are implementing
+a protocol that specifies them.
 
 ```csharp
-// Server (ASP.NET Core)
+// ASP.NET Core WebSocket server
 app.UseWebSockets();
 app.Map("/ws", async context =>
 {
@@ -434,196 +235,101 @@ app.Map("/ws", async context =>
     }
 
     using var ws = await context.WebSockets.AcceptWebSocketAsync();
-    var buffer = new byte[4096];
+    var buffer   = new byte[1024 * 4];
 
     while (ws.State == WebSocketState.Open)
     {
         var result = await ws.ReceiveAsync(buffer, ct);
         if (result.MessageType == WebSocketMessageType.Close)
-        {
-            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", ct);
             break;
-        }
 
         var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-        var reply = $"Echo: {message}";
-        await ws.SendAsync(
-            Encoding.UTF8.GetBytes(reply),
-            WebSocketMessageType.Text,
-            endOfMessage: true,
-            ct);
+        var response = Encoding.UTF8.GetBytes($"Echo: {message}");
+        await ws.SendAsync(response, WebSocketMessageType.Text, endOfMessage: true, ct);
     }
+
+    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", ct);
 });
 
 // Client
-using var client = new ClientWebSocket();
-await client.ConnectAsync(new Uri("ws://localhost:5000/ws"), ct);
-
-await client.SendAsync(
-    Encoding.UTF8.GetBytes("Hello"),
-    WebSocketMessageType.Text,
-    true, ct);
-
-var buf = new byte[4096];
-var r = await client.ReceiveAsync(buf, ct);
-Console.WriteLine(Encoding.UTF8.GetString(buf, 0, r.Count));
+using var wsClient = new ClientWebSocket();
+await wsClient.ConnectAsync(new Uri("ws://localhost:5000/ws"), ct);
+await wsClient.SendAsync(Encoding.UTF8.GetBytes("Hello"), WebSocketMessageType.Text, true, ct);
 ```
 
 ---
 
-## 13.4 HTTP/3 and QUIC (NET 9+)
+## 13.4 mDNS / Zeroconf — Local Network Service Discovery
+
+mDNS (Multicast DNS) allows services to discover each other on a local
+network without a central DNS server. Services broadcast their presence,
+and clients scan for them. This is how printers and network drives
+appear automatically on your laptop, and how Sync.Mesh discovers peers.
+
+```bash
+dotnet add package Zeroconf
+```
 
 ```csharp
-// Enable HTTP/3 in Kestrel
-builder.WebHost.ConfigureKestrel(opts =>
+// Advertise a service on the local network
+// (Uses _syncmesh._tcp as the service type)
+using var server = new MdnsServiceRegistration("syncmesh", "_syncmesh._tcp", 50051,
+    properties: new[] { ("nodeId", nodeId), ("version", "1.0") });
+await server.StartAsync(ct);
+
+// Scan for services on the local network
+var discovered = await ZeroconfResolver.ResolveAsync("_syncmesh._tcp.",
+    scanTime: TimeSpan.FromSeconds(5),
+    cancellationToken: ct);
+
+foreach (var host in discovered)
 {
-    opts.ListenAnyIP(443, listen =>
+    Console.WriteLine($"Found: {host.DisplayName} at {host.IPAddress}:{host.Port}");
+    // host.Properties contains the TXT record key-value pairs
+}
+```
+
+---
+
+## 13.5 HTTP/3 and QUIC (.NET 9+)
+
+HTTP/3 runs over QUIC (a UDP-based transport) rather than TCP. This
+eliminates TCP's head-of-line blocking: in HTTP/2, a lost packet stalls
+all streams; in QUIC, each stream is independent. On lossy connections
+(mobile networks, satellite), HTTP/3 is significantly faster.
+
+ASP.NET Core Kestrel supports HTTP/3 out of the box:
+
+```csharp
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenLocalhost(5001, listenOptions =>
     {
-        listen.UseHttps();
-        listen.Protocols = HttpProtocols.Http1AndHttp2AndHttp3;
+        listenOptions.UseHttps();
+        listenOptions.Protocols = HttpProtocols.Http1AndHttp2AndHttp3;
     });
 });
-
-// QUIC connection (low-level, System.Net.Quic)
-using System.Net.Quic;
-using System.Net.Security;
-
-var options = new QuicClientConnectionOptions
-{
-    RemoteEndPoint = new DnsEndPoint("example.com", 443),
-    DefaultStreamErrorCode = 0,
-    DefaultCloseErrorCode = 0,
-    IdleTimeout = TimeSpan.FromSeconds(60),
-    ClientAuthenticationOptions = new SslClientAuthenticationOptions
-    {
-        ApplicationProtocols = new[] { new SslApplicationProtocol("myproto") },
-        TargetHost = "example.com",
-    }
-};
-
-await using var connection = await QuicConnection.ConnectAsync(options, ct);
-await using var stream = await connection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional, ct);
-
-await stream.WriteAsync(Encoding.UTF8.GetBytes("HELLO"), ct);
-await stream.FlushAsync(ct);
-
-var buffer = new byte[1024];
-int read = await stream.ReadAsync(buffer, ct);
-Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, read));
 ```
+
+`HttpClient` in .NET 9+ automatically upgrades to HTTP/3 if the server
+advertises support via the `Alt-Svc` header — no client code changes
+needed.
 
 ---
 
-## 13.5 mDNS / Zeroconf (Service Discovery)
+## 13.6 Connecting Networking to the Rest of the Book
 
-For local P2P discovery (like SyncDot):
-
-```csharp
-// Install: Zeroconf NuGet package
-
-using Zeroconf;
-
-// Discover services
-var results = await ZeroconfResolver.ResolveAsync("_syncdot._tcp.local.");
-foreach (var host in results)
-{
-    Console.WriteLine($"Found: {host.DisplayName} @ {host.IPAddresses.First()}:{host.Services.Values.First().Port}");
-}
-
-// Advertise a service (using dns-sd / Avahi on Linux)
-// In systemd unit or shell:
-// avahi-publish-service "SyncDot-{hostname}" _syncdot._tcp 50051
-```
-
-> **Rider tip:** *View → Tool Windows → HTTP Client* lets you write and send HTTP requests directly from Rider with full IntelliSense for headers and JSON bodies. The `.http` file format is also supported in VS Code.
-
-> **VS tip:** *View → Other Windows → Web API Tester* (or install the *REST Client* extension). Rider's HTTP client is more full-featured for this use case.
-
-
----
-
-## 13.6 SignalR — Real-Time Communication
-
-SignalR provides real-time bidirectional communication between server and clients.
-Used for: live dashboards, chat, notifications, collaborative editing.
-
-```csharp
-// Install: Microsoft.AspNetCore.SignalR
-
-// Hub definition
-public class NotificationHub : Hub
-{
-    // Server → specific client
-    public async Task SendToUser(string userId, string message)
-        => await Clients.User(userId).SendAsync("ReceiveNotification", message);
-
-    // Server → group
-    public async Task JoinGroup(string groupName)
-    {
-        await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
-        await Clients.Group(groupName).SendAsync("UserJoined", Context.ConnectionId);
-    }
-
-    // Client → server (called from browser)
-    public async Task SendMessage(string message)
-    {
-        var user = Context.User?.Identity?.Name ?? "Anonymous";
-        await Clients.All.SendAsync("ReceiveMessage", user, message);
-    }
-
-    // Connection lifecycle
-    public override async Task OnConnectedAsync()
-    {
-        await base.OnConnectedAsync();
-        Console.WriteLine($"Connected: {Context.ConnectionId}");
-    }
-
-    public override async Task OnDisconnectedAsync(Exception? ex)
-    {
-        Console.WriteLine($"Disconnected: {Context.ConnectionId}");
-        await base.OnDisconnectedAsync(ex);
-    }
-}
-
-// Program.cs
-builder.Services.AddSignalR();
-app.MapHub<NotificationHub>("/hubs/notifications");
-
-// Send from anywhere in the app (inject IHubContext)
-public class OrderService
-{
-    private readonly IHubContext<NotificationHub> _hub;
-
-    public OrderService(IHubContext<NotificationHub> hub) => _hub = hub;
-
-    public async Task PlaceOrderAsync(Order order, CancellationToken ct)
-    {
-        await _repo.SaveAsync(order, ct);
-        // Push real-time notification to all clients
-        await _hub.Clients.All.SendAsync("OrderPlaced",
-            new { order.Id, order.Total }, ct);
-    }
-}
-```
-
-```javascript
-// Client (JavaScript)
-const connection = new signalR.HubConnectionBuilder()
-    .withUrl("/hubs/notifications")
-    .withAutomaticReconnect()
-    .build();
-
-connection.on("ReceiveNotification", (message) => {
-    console.log("Notification:", message);
-});
-
-connection.on("OrderPlaced", (data) => {
-    updateDashboard(data);
-});
-
-await connection.start();
-await connection.invoke("JoinGroup", "dashboard");
-```
-
----
-
+- **Ch 8 (Async)** — every network operation returns a `Task`. The
+  async model is what allows a server to handle thousands of concurrent
+  connections with a small thread pool.
+- **Ch 14 (ASP.NET Core)** — HTTP server hosting, middleware, and
+  request routing sit on top of Kestrel's networking layer.
+- **Ch 31 (SignalR)** — the high-level real-time framework built on
+  WebSockets (with HTTP long-polling fallback).
+- **Ch 28 (Security)** — TLS termination, certificate pinning, and JWT
+  validation all happen at the network boundary.
+- **Ch 30 (Observability)** — distributed tracing propagates context
+  (trace ID, span ID) through HTTP and gRPC headers. Understanding the
+  underlying transport helps understand how tracing works.
+- **Ch 37 (Pet Projects V)** — a complete gRPC streaming service with
+  server-side stream broadcasting via Channel<T>.

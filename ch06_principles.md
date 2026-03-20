@@ -1126,3 +1126,794 @@ Is the simplest solution actually shipping?         → §6.16 KISS
 
 Yes to any of these is a signal to redesign before the bug exists.
 
+---
+
+## 6.22 The One Idea Behind All of It
+
+Every principle above is ultimately the same idea expressed from a different angle:
+**localise change**.
+
+When a requirement changes — and it always does — you want to touch as few places as
+possible, and you want those places to be obvious. Bad design means a small requirement
+change ripples across twenty files. Good design means it touches one. Every principle
+is a strategy for achieving that localisation.
+
+Once you see this thread, the principles stop feeling like a checklist and start
+feeling derivable. You could almost rediscover them yourself by asking "what makes
+change expensive?" and systematically eliminating each answer:
+
+```
+What makes change expensive?
+  → Duplicated knowledge (DRY)
+  → Hidden dependencies (Explicit over Implicit)
+  → Scattered decisions (Tell Don't Ask)
+  → Classes with multiple reasons to change (SRP)
+  → Inheritance hierarchies that must all move together (Composition over Inheritance)
+  → Invalid states that must be defended everywhere (Make Illegal States Unrepresentable)
+  → Invisible failure paths (Errors are Values)
+```
+
+They are all the same answer, zoomed into different parts of the codebase.
+
+---
+
+## 6.23 The Anemic Domain Model — The Most Common Violation
+
+Martin Fowler named this anti-pattern in 2003. Two decades later it remains
+the dominant structure in enterprise C# codebases.
+
+An anemic domain model is one where entities are passive data bags — public getters
+and setters, no behaviour, no enforcement of their own rules. All the logic lives
+in service classes that reach in, read state, make decisions, and mutate the entity
+directly:
+
+```csharp
+// Anemic entity — a database row with C# syntax
+public class Order
+{
+    public int      Id         { get; set; }
+    public string   Status     { get; set; } = "pending"; // magic string
+    public decimal  Total      { get; set; }
+    public DateTime? ShippedAt { get; set; }
+}
+
+// OrderService does everything the entity should know about itself
+public class OrderService
+{
+    public void Ship(Order order)
+    {
+        if (order.Status != "paid")
+            throw new Exception("Cannot ship unpaid order");
+
+        order.Status   = "shipped";       // anyone can do this directly
+        order.ShippedAt = DateTime.Now;   // bypassing every rule
+    }
+
+    public void Cancel(Order order, string reason)
+    {
+        if (order.Status == "shipped")
+            throw new Exception("Cannot cancel shipped order");
+        if (order.Status == "delivered")    // same check, different method — will drift
+            throw new Exception("Cannot cancel delivered order");
+
+        order.Status = "cancelled";
+    }
+}
+```
+
+The problem is not the service itself — services are necessary. The problem is
+that the *decision logic* lives outside the entity while the *data* lives inside it.
+They are split. Now:
+
+- Nothing stops `order.Status = "shipped"` directly — bypassing every check
+- The cancellation rules are duplicated in every method that touches status
+- A new developer has no idea the rules exist without reading all services
+- The compiler sees nothing wrong with any illegal state
+
+This violates §6.1 (illegal states unrepresentable), §6.18 (tell don't ask),
+§6.15 (DRY — the rules for cancellation are duplicated), and §6.6 (explicit —
+the rules are hidden in services, not declared in the type).
+
+The seductive argument for anemic models is "the Core should have no dependencies,
+and behaviour depends on services". This confuses two different things. An entity's
+*invariant enforcement* requires no dependencies at all — knowing that a shipped
+order must have been paid does not require a database, an email sender, or an HTTP
+client. The rule "no dependencies in the domain" means no *infrastructure*
+dependencies. It does not mean no *behaviour*.
+
+---
+
+## 6.24 The Rich Domain Model — Entities That Own Their Invariants
+
+A rich domain model moves the decision logic back where it belongs — inside the
+entity that owns the data. The entity becomes a gatekeeper: you can only modify
+it through methods that enforce the rules. The compiler and the runtime make
+illegal states impossible, not just discouraged.
+
+```csharp
+public class Order
+{
+    // Private setters — nothing outside this class can mutate state directly
+    public OrderId     Id         { get; private set; }
+    public OrderStatus Status     { get; private set; }  // enum, not string
+    public Money       Total      { get; private set; }  // value object, not decimal
+    public DateTime?   ShippedAt  { get; private set; }
+
+    private readonly List<OrderItem> _items = new();
+    public IReadOnlyList<OrderItem> Items => _items.AsReadOnly();
+
+    // Factory method — the only valid way to create an Order
+    public static Order Place(CustomerId customerId, IEnumerable<OrderItem> items)
+    {
+        var list = items.ToList();
+        if (!list.Any())
+            throw new OrderException(OrderError.OrderMustHaveItems, default);
+
+        return new Order
+        {
+            Id     = OrderId.New(),
+            Status = OrderStatus.Pending,
+            Total  = list.Aggregate(Money.Zero("EUR"), (acc, i) => acc.Add(i.LineTotal))
+        };
+    }
+
+    // Behaviour — the entity decides what shipping means and what allows it
+    public Result Ship()
+    {
+        if (Status != OrderStatus.Paid)
+            return Result.Fail(Error.CannotShipUnpaidOrder(Id));
+
+        Status    = OrderStatus.Shipped;
+        ShippedAt = DateTime.UtcNow;
+        return Result.Ok();
+    }
+
+    public Result Cancel(string reason)
+    {
+        if (Status is OrderStatus.Shipped or OrderStatus.Delivered)
+            return Result.Fail(Error.CannotCancelShippedOrder(Id));
+
+        if (string.IsNullOrWhiteSpace(reason))
+            return Result.Fail(new Error("REASON_REQUIRED", "Cancellation reason required."));
+
+        Status       = OrderStatus.Cancelled;
+        CancelReason = reason;
+        return Result.Ok();
+    }
+}
+```
+
+Now `order.Status = "shipped"` is a compile error — `Status` has no public setter.
+The only path to `Shipped` is through `Ship()`, which enforces payment first.
+The rule exists in exactly one place. It cannot drift.
+
+The service becomes a coordinator, not a decision-maker:
+
+```csharp
+public class ShipOrderHandler(IOrderRepository orders)
+{
+    public async Task<Result> HandleAsync(ShipOrderCommand cmd, CancellationToken ct)
+    {
+        var order = await orders.GetByIdAsync(cmd.OrderId, ct);
+        if (order is null) return Result.Fail(Error.OrderNotFound(cmd.OrderId));
+
+        var result = order.Ship();          // entity enforces the rule
+        if (result.IsFailure) return result;
+
+        await orders.SaveAsync(order, ct);
+        return Result.Ok();
+    }
+}
+```
+
+The handler has no if-statements about order status. It does not need to.
+The entity handles that. This is §6.18 (Tell Don't Ask) expressed architecturally.
+
+---
+
+## 6.25 Value Objects — Primitives With Domain Meaning
+
+The principle in §6.10 says to wrap naked primitives. Here is the full picture of
+what value objects are and why they are not just wrapper classes.
+
+A value object is defined entirely by its content. Two value objects with the same
+content are equal. They have no identity beyond their value. They are immutable.
+They enforce their own validity at construction — if construction succeeds, the
+object is valid. Always. No re-checking required anywhere in the system.
+
+```csharp
+// Without value objects: scattered rules, silent bugs
+void SendEmail(string from, string to, string subject) { }
+SendEmail(subject, to, from);   // transposed — compiles, fails silently
+
+// With value objects: rules enforced once, bugs impossible
+public sealed record EmailAddress
+{
+    public string Value { get; }
+
+    public EmailAddress(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Email cannot be empty");
+        if (!value.Contains('@'))
+            throw new ArgumentException($"'{value}' is not a valid email");
+
+        Value = value.Trim().ToLowerInvariant(); // normalised at construction
+    }
+
+    public override string ToString() => Value;
+    public static implicit operator string(EmailAddress e) => e.Value;
+}
+
+void SendEmail(EmailAddress from, EmailAddress to, Subject subject) { }
+// SendEmail(subject, to, from) → compile error — Subject is not EmailAddress
+```
+
+Value objects collapse three things into one:
+1. Validation — runs at construction, nowhere else
+2. Normalisation — `ToLowerInvariant()` happens once, the value is always clean
+3. Type safety — `EmailAddress` and `Subject` cannot be confused by position
+
+The subtler benefit: when `EmailAddress` is accepted throughout your codebase, a new
+developer immediately knows that any `EmailAddress` parameter is already valid and
+normalised. They do not check again. They do not need to. The type is proof.
+
+```csharp
+// Strongly typed IDs — the most valuable and most ignored value object
+public readonly record struct OrderId(Guid Value)
+{
+    public static OrderId New()             => new(Guid.NewGuid());
+    public static OrderId From(Guid value)  => new(value);
+    public override string ToString()       => Value.ToString();
+}
+
+public readonly record struct CustomerId(Guid Value)
+{
+    public static CustomerId New()           => new(Guid.NewGuid());
+    public static CustomerId From(Guid value) => new(value);
+}
+
+// Without typed IDs: these compile and silently corrupt data
+void ProcessOrder(Guid orderId, Guid customerId) { }
+ProcessOrder(customerId, orderId);   // transposed — silent data corruption
+
+// With typed IDs: compile error
+void ProcessOrder(OrderId orderId, CustomerId customerId) { }
+ProcessOrder(customerId, orderId);   // CS1503 — cannot convert CustomerId to OrderId
+```
+
+---
+
+## 6.26 Failures as Values — The Full Result Pattern
+
+§6.3 introduced the principle. This section shows the full implementation and
+the philosophy behind choosing exceptions versus Result.
+
+### The Two Categories of Failure
+
+```
+Infrastructure failure:          Business failure:
+  Disk full                        Order cannot be shipped — not paid
+  Network timeout                  User not found
+  Database connection lost         Insufficient stock
+  Out of memory                    Password validation failed
+
+→ throw Exception                → return Result<T>
+  (unrecoverable, log and crash)   (expected outcome, caller handles it)
+```
+
+The test: could a correct, well-behaved caller encounter this failure in normal
+operation? If yes, it is a business failure — return Result. If the only way to
+encounter it is through a programming error or infrastructure collapse — throw.
+
+### Railway Oriented Programming
+
+The mental model for working with Result chains. A computation is a railway track
+with two rails: the success rail and the failure rail. Each function is a step on
+the track. If a step succeeds, it stays on the success rail and the next step runs.
+If a step fails, it switches to the failure rail and stays there — subsequent steps
+are skipped automatically.
+
+```csharp
+// Without Railway — nested ifs, early returns, hard to follow
+public async Task<Result<OrderId>> PlaceOrderAsync(PlaceOrderCommand cmd, CancellationToken ct)
+{
+    var customer = await _customers.GetByIdAsync(cmd.CustomerId, ct);
+    if (customer is null)
+        return Result<OrderId>.Fail(Error.CustomerNotFound(cmd.CustomerId));
+
+    if (!customer.IsActive)
+        return Result<OrderId>.Fail(Error.CustomerInactive(cmd.CustomerId));
+
+    var order = Order.Place(cmd.CustomerId, cmd.Items);
+    if (order.IsFailure)
+        return Result<OrderId>.Fail(order.Error!);
+
+    await _orders.AddAsync(order.Value!, ct);
+    return Result<OrderId>.Ok(order.Value!.Id);
+}
+
+// With Railway — linear pipeline, failure short-circuits automatically
+public async Task<Result<OrderId>> PlaceOrderAsync(PlaceOrderCommand cmd, CancellationToken ct)
+{
+    return await _customers.GetByIdAsync(cmd.CustomerId, ct)
+        .ToResult(Error.CustomerNotFound(cmd.CustomerId))
+        .Ensure(c => c.IsActive, Error.CustomerInactive(cmd.CustomerId))
+        .Then(customer => Order.Place(customer.Id, cmd.Items))
+        .ThenAsync(order => _orders.AddAsync(order, ct)
+            .ContinueWith(_ => Result<OrderId>.Ok(order.Id)));
+}
+```
+
+### Typed Error Codes — Machine-Readable and Stable
+
+Throwing exceptions with string messages is honest about failure but forces callers
+to parse strings to distinguish failure types — fragile and invisible. The solution
+is an error type with a stable code and a human-readable message:
+
+```csharp
+public sealed record Error(string Code, string Message)
+{
+    // Static factories make usage read naturally at the call site
+    public static Error CustomerNotFound(CustomerId id) =>
+        new("CUSTOMER_NOT_FOUND", $"Customer {id} does not exist.");
+
+    public static Error CannotShipUnpaidOrder(OrderId id) =>
+        new("ORDER_NOT_PAID", $"Order {id} must be paid before shipping.");
+
+    public static Error InsufficientStock(Guid productId, int requested) =>
+        new("INSUFFICIENT_STOCK", $"Product {productId} has insufficient stock for {requested} units.");
+}
+```
+
+The `Code` is for programs — it is stable, never changes even if the message wording
+does. The `Message` is for developers and logs. The controller maps codes to HTTP
+status codes without string parsing:
+
+```csharp
+return result.Match(
+    onSuccess: id   => CreatedAtAction(...),
+    onFailure: error => error.Code switch
+    {
+        "CUSTOMER_NOT_FOUND"  => NotFound(error.Message),
+        "ORDER_NOT_PAID"      => UnprocessableEntity(error.Message),
+        "INSUFFICIENT_STOCK"  => Conflict(error.Message),
+        _                     => BadRequest(error.Message)
+    });
+```
+
+### Exception Messages in the Domain Layer
+
+Hardcoded strings in `throw` statements inside domain entities are fine for one
+purpose: developer diagnostics. Exception messages appear in logs and test failure
+output where a human reads them. For that purpose, a clear descriptive string is
+correct and hardcoding is appropriate.
+
+They are wrong when passed directly to API consumers or when callers need to
+distinguish failure types programmatically. For those cases use typed errors
+(as above) or the Result pattern. The rule is simple:
+
+```
+Domain entity throws → use for programmer errors (null args, broken invariants)
+Domain entity returns Result → use for expected business failures
+API controller catches → map typed errors to HTTP codes, never string-match messages
+```
+
+---
+
+## 6.27 Domain Services — Behaviour That Does Not Belong to One Entity
+
+When a business rule involves multiple aggregates and cannot logically belong to
+either alone, it belongs in a Domain Service. The smell that tells you one is needed:
+you find yourself writing `order.ApplyCustomerDiscount(customer)` — one entity
+reaching into another entity's data to make a decision.
+
+```csharp
+// WRONG: Order knows about Customer internals
+public class Order
+{
+    public void ApplyDiscount(Customer customer)
+    {
+        if (customer.TierLevel == "Gold")   // Order coupled to Customer structure
+            Total = Total.Multiply(0.9m);
+    }
+}
+
+// CORRECT: Domain Service knows both, neither entity knows the other
+// Lives in the Domain layer — pure logic, no infrastructure
+public class OrderPricingService
+{
+    public Result<Money> CalculateFinalPrice(Order order, Customer customer)
+    {
+        var discount = customer.Tier switch
+        {
+            CustomerTier.Gold     => 0.10m,
+            CustomerTier.Silver   => 0.05m,
+            _                     => 0.00m
+        };
+
+        var discounted = order.Total.Multiply(1 - discount);
+
+        if (discounted.Amount > customer.CreditLimit)
+            return Result<Money>.Fail(new Error("OVER_CREDIT_LIMIT",
+                $"Order total {discounted} exceeds credit limit {customer.CreditLimit}."));
+
+        return Result<Money>.Ok(discounted);
+    }
+}
+```
+
+The boundary between Domain Service and Application Service (handler) is sharp:
+
+```
+Domain Service:
+  ✓ Pure business logic involving multiple entities or value objects
+  ✓ No infrastructure dependencies — no DB, no HTTP, no email
+  ✓ Lives in the Domain project
+  ✓ Returns domain objects or Result<T>
+
+Application Service / Handler:
+  ✓ Orchestrates: loads aggregates, calls domain, persists, publishes events
+  ✓ Has infrastructure dependencies via interfaces
+  ✓ Lives in the Application project
+  ✗ Never contains business rules — only coordination
+```
+
+If you find yourself putting an `IOrderRepository` into a Domain Service, stop —
+you are writing an Application Service. Domain Services receive already-loaded
+domain objects as parameters. They never load them themselves.
+
+---
+
+## 6.28 Aggregate Roots — Consistency Boundaries
+
+An aggregate is a cluster of objects that must be consistent with each other at all
+times. The aggregate root is the single gatekeeper — all modifications to the cluster
+must go through it. This directly implements §6.1 (illegal states unrepresentable)
+and §6.18 (tell don't ask) at the object graph level.
+
+```csharp
+// Without aggregate root: the items collection is publicly exposed
+// Nothing prevents bypassing Order's rules
+order.Items.Add(new OrderItem(...));   // Total is now wrong
+order.Items.Clear();                   // order has no items — invalid state
+order.Items[0].Quantity = 0;           // invalid quantity, unchecked
+
+// With aggregate root: all mutations go through methods that maintain invariants
+public class Order   // aggregate root
+{
+    private readonly List<OrderItem> _items = new();
+    public IReadOnlyList<OrderItem> Items => _items.AsReadOnly(); // read-only view
+
+    public Result AddItem(Guid productId, string name, int quantity, Money unitPrice)
+    {
+        if (Status != OrderStatus.Pending)
+            return Result.Fail(new Error("ORDER_LOCKED",
+                "Items can only be added to Pending orders."));
+
+        if (quantity <= 0)
+            return Result.Fail(new Error("INVALID_QUANTITY", "Quantity must be positive."));
+
+        var existing = _items.FirstOrDefault(i => i.ProductId == productId);
+        if (existing is not null)
+            existing.IncreaseQuantity(quantity);  // merge, not duplicate
+        else
+            _items.Add(new OrderItem(productId, name, quantity, unitPrice));
+
+        RecalculateTotal();  // invariant maintained here, not by the caller
+        return Result.Ok();
+    }
+
+    private void RecalculateTotal()
+    {
+        Total      = _items.Aggregate(Money.Zero(Total.Currency), (a, i) => a.Add(i.LineTotal));
+        IsPriority = Total.Amount >= 500m;
+    }
+}
+```
+
+### The Aggregate Boundary Is a Transaction Boundary
+
+Everything inside one aggregate saves atomically. Changes across two aggregates
+require two transactions — they achieve consistency eventually via domain events,
+not by sharing a transaction.
+
+```csharp
+// WRONG: two aggregates in one transaction
+// If Inventory save fails, Order is in a corrupt state
+await _db.SaveChangesAsync();   // saves Order AND Inventory together
+
+// CORRECT: each aggregate has its own transaction
+// Consistency across aggregates via domain events
+await _orders.AddAsync(order, ct);          // transaction 1: save order
+
+await _events.PublishAsync(                  // signals Inventory to decrement
+    new OrderPlacedEvent(order.Id, order.Items), ct);
+// Inventory handler runs separately, in its own transaction
+// If it fails, a compensating event is raised — not a transaction rollback
+```
+
+### How Large Should an Aggregate Be?
+
+Small. The temptation is to aggregate eagerly. Resist it.
+
+```
+WRONG — Customer swallowed by Order:    CORRECT — separate aggregates:
+Order                                   Order
+  ├── OrderItems ✓                        ├── OrderItems ✓
+  ├── Customer ✗ (own lifecycle)          └── CustomerId (reference only)
+  ├── ShippingAddress ✓ (value object)
+  └── Invoice ✗ (own lifecycle)         Customer (separate)
+                                         Invoice (separate)
+```
+
+If an object has its own identity, its own lifecycle, and its own invariants, it
+is its own aggregate. Reference it by ID, not by navigation property. This keeps
+aggregates small, transactions fast, and concurrency conflicts rare.
+
+---
+
+## 6.29 CQRS — Reads and Writes Are Different Problems
+
+Command Query Responsibility Segregation is §6.19 (Command Query Separation) applied
+at the architectural level. The insight it adds: not only should individual methods
+be either commands or queries, but the entire stack for reads and writes should be
+separate, because they have fundamentally different needs.
+
+The rich domain model built in §6.24 is optimised for enforcing invariants. It is
+wrong for reads. Loading an `Order` aggregate with its items, value objects, and
+factory methods just to render a list page is wasteful in three ways:
+- It loads more data than the query needs
+- It cannot naturally join `Customer.Name` without a second query
+- It forces every read to pay the overhead of the write model
+
+```csharp
+// WRONG for reads: loads the full aggregate, triggers N+1 for CustomerName
+var orders   = await _orderRepo.GetAllAsync(ct);
+var summaries = await Task.WhenAll(orders.Select(async o => new OrderSummaryDto(
+    o.Id.Value,
+    (await _customerRepo.GetByIdAsync(o.CustomerId, ct))!.Name,  // N+1
+    o.Status.ToString(),
+    o.Total.ToString(),
+    o.Items.Count)));
+
+// CORRECT for reads: direct SQL, one query, exactly the shape needed
+public class GetOrdersHandler(IDbConnectionFactory db)
+{
+    public async Task<IReadOnlyList<OrderSummaryDto>> HandleAsync(
+        GetOrdersQuery query, CancellationToken ct)
+    {
+        await using var conn = await db.OpenAsync(ct);
+
+        return (await conn.QueryAsync<OrderSummaryDto>("""
+            SELECT
+                o.id,
+                c.name           AS customer_name,
+                o.status,
+                o.total_amount,
+                o.total_currency,
+                o.is_priority,
+                o.created_at,
+                COUNT(i.id)      AS item_count
+            FROM orders o
+            JOIN customers c ON c.id = o.customer_id
+            LEFT JOIN order_items i ON i.order_id = o.id
+            WHERE (@Status IS NULL OR o.status = @Status)
+            GROUP BY o.id, c.name, o.status,
+                     o.total_amount, o.total_currency,
+                     o.is_priority, o.created_at
+            ORDER BY o.created_at DESC
+            LIMIT @PageSize OFFSET @Offset
+            """, new { query.Status, query.PageSize, Offset = query.Page * query.PageSize }))
+            .ToList();
+    }
+}
+```
+
+The read handler has no domain entity, no repository interface, no value objects.
+It runs one SQL query and maps the result. It is completely independent of the write
+stack. Optimise the SQL, add an index, add a new column — no domain class changes.
+
+### The File Structure That Makes CQRS Visible
+
+```
+Application/
+└── Orders/
+    ├── Commands/              ← write stack
+    │   ├── PlaceOrder/
+    │   │   ├── PlaceOrderCommand.cs
+    │   │   └── PlaceOrderHandler.cs
+    │   └── ShipOrder/
+    │       ├── ShipOrderCommand.cs
+    │       └── ShipOrderHandler.cs
+    └── Queries/               ← read stack
+        ├── GetOrders/
+        │   ├── GetOrdersQuery.cs
+        │   ├── GetOrdersHandler.cs
+        │   └── OrderSummaryDto.cs     ← read model, flat, optimised for display
+        └── GetOrderById/
+            ├── GetOrderByIdQuery.cs
+            ├── GetOrderByIdHandler.cs
+            └── OrderDetailDto.cs
+```
+
+The directory structure makes the separation visible. A new developer opening
+`Commands/` knows they are in write territory. Opening `Queries/` knows they are
+in read territory. The models never cross.
+
+---
+
+## 6.30 Where DTOs and Persistence Models Live
+
+This question resolves naturally once you accept that every model has exactly one
+master. The mistake that leads to polluted domain entities is asking one model to
+serve multiple masters simultaneously.
+
+```
+Model              Master              Location
+─────────────────────────────────────────────────────────────
+Domain Entity      Business rules      Domain project
+Persistence Model  Database schema     Infrastructure project
+Command/Query DTO  Application use     Application project
+Request/Response   HTTP contract       API project
+```
+
+```
+OrderApp/
+├── Domain/
+│   └── Orders/
+│       ├── Order.cs              ← no [Column], no [JsonProperty], pure domain
+│       └── IOrderRepository.cs  ← interface only, defined by the domain
+│
+├── Infrastructure/
+│   └── Persistence/
+│       ├── Models/
+│       │   └── OrderDbModel.cs  ← EF Core entity, flat, maps to table columns
+│       ├── Mappings/
+│       │   └── OrderMapping.cs  ← domain ↔ db translation, the only place that knows both
+│       └── OrderRepository.cs   ← implements IOrderRepository
+│
+├── Application/
+│   └── Orders/
+│       └── Queries/
+│           └── GetOrders/
+│               └── OrderSummaryDto.cs  ← read model for this specific query
+│
+└── Api/
+    └── Orders/
+        ├── Requests/
+        │   └── PlaceOrderRequest.cs   ← JSON shape the API accepts
+        ├── Responses/
+        │   └── OrderResponse.cs       ← JSON shape the API returns
+        └── Mappings/
+            └── OrderApiMapping.cs     ← request/response ↔ command/query, the only place that knows both
+```
+
+Yes, this is duplication. The `Order.Id` field exists as `OrderId Id` in the domain,
+as `Guid Id` in the persistence model, and as `Guid id` in the response DTO. That
+duplication is not a smell — it is the cost of having each model be honest about
+what it is for. The alternative — one model carrying `[Column("id")]` and
+`[JsonPropertyName("id")]` next to domain methods — is a model lying in all three
+directions at once.
+
+The duplication cost is a few mapping files. The benefit is that when the
+database schema renames a column, you touch the persistence model and its mapping.
+The domain entity never changes. The API response never changes. Each layer is
+protected from the other's changes.
+
+---
+
+## 6.31 Connascence — The Deep Theory of Coupling
+
+Most developers know "coupling is bad" but cannot say precisely what it is.
+Connascence is the precise definition. Two components are connascent if a change
+to one requires a change to the other to preserve correctness.
+
+There is a hierarchy from weakest (tolerable) to strongest (catastrophic):
+
+**Connascence of Name** — they share a name. Method name, variable name.
+The weakest form — refactoring tools handle it automatically.
+```csharp
+order.Ship();   // OrderController and ShipOrderHandler both call Ship() — name connascence
+```
+
+**Connascence of Type** — they share a type. Normal and acceptable.
+```csharp
+void Process(Order order) { }   // caller and callee share the Order type
+```
+
+**Connascence of Meaning** — they share an implicit convention. The most insidious.
+```csharp
+// "0 = success, 1 = validation failure, 2 = not found" — where is this documented?
+// Change one side and nothing tells you to update the other.
+int result = ProcessOrder(request);
+if (result == 1) ShowValidationError();  // what if ProcessOrder changes 1 to mean something else?
+```
+
+**Connascence of Position** — they depend on argument order.
+```csharp
+CreateUser("Alice", "Smith", 30);   // which is first name? second name? age?
+// Swap two strings — compiles, wrong, silent
+// Value objects (§6.10 and §6.25) eliminate this entirely
+```
+
+**Connascence of Algorithm** — both sides must use the same algorithm.
+```csharp
+// Client hashes password with SHA-256 before sending
+// Server validates the hash with SHA-256
+// Change one → the other breaks silently — no compiler error, no test failure
+// Fix: own the algorithm in one shared type
+```
+
+**Connascence of Execution** — they must be called in a specific order.
+```csharp
+var service = new OrderService();
+service.Init();          // must call before Process
+service.Process(order);  // must call before Complete
+service.Complete();      // temporal coupling — the worst kind
+// Fix: constructor establishes valid initial state, no Init() required
+```
+
+Once you have this vocabulary you can name exactly what is wrong with a piece of
+code. "This is connascence of algorithm between the client and the server —
+we need to own this in a shared library." Naming the problem precisely is
+halfway to solving it.
+
+### The Stability Direction Rule
+
+Depend in the direction of stability. A module that changes rarely should not
+depend on a module that changes frequently.
+
+```
+Stable (changes rarely):     Unstable (changes often):
+  Domain rules                 API contract
+  Core algorithms              Database schema
+  Mathematical operations      UI layout
+  Business invariants          Configuration format
+
+Rule: unstable things depend on stable things.
+      Stable things never depend on unstable things.
+
+This is why the Domain has no dependencies.
+This is why Infrastructure depends on Domain, not the other way around.
+This is why the API project depends on Application, which depends on Domain.
+The arrow always points toward the most stable thing.
+```
+
+---
+
+## 6.32 The Revised Self-Check
+
+The original checklist in §6.21 plus the structural questions from this section:
+
+```
+On any class or method:
+  Can this be constructed in an invalid state?             → §6.1  Illegal states
+  Can callers ignore failure paths?                        → §6.3  Errors are values
+  Does it take/return naked primitives with domain meaning? → §6.10 Domain primitives
+  Does this class have more than one reason to change?     → §6.7  SRP
+  Does it depend on something not in its signature?        → §6.6  Explicit over implicit
+  Could a new enum case be silently ignored?               → §6.5  Totality
+  Is there a number or string literal with no name?        → §6.11 No magic numbers
+  Does a method chain through three or more objects?       → §6.17 Law of Demeter
+  Does code outside an entity decide its state?            → §6.18 Tell, don't ask
+  Does a method both change state AND return data?         → §6.19 CQS
+  Did I write more than the current requirement needs?     → §6.14 YAGNI
+  Is the simplest solution actually shipping?              → §6.16 KISS
+
+On domain entities:
+  Can an entity be put into an invalid state by any caller? → §6.23 Rich domain model
+  Are business rules for this entity scattered in services? → §6.23 Anemic domain model
+  Do primitives carry domain meaning without a wrapper?     → §6.25 Value objects
+  Does a rule involve two entities but live in one of them? → §6.27 Domain services
+  Can anything bypass the aggregate root to mutate items?   → §6.28 Aggregates
+
+On architecture:
+  Is a read operation using the full write-side domain model? → §6.29 CQRS
+  Does a model serve more than one master (DB + JSON + rules)? → §6.30 DTO placement
+  Does a stable module depend on an unstable one?             → §6.31 Connascence / stability
+  Can a failure type be distinguished without parsing strings? → §6.26 Typed errors
+```
+
+Yes to any of these is a signal to redesign before the bug exists.
+

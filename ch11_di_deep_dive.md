@@ -1,640 +1,376 @@
 # Chapter 11 — Dependency Injection: The Complete Picture
 
-Every code example in this chapter is **fully standalone**.
+> Chapter 10 introduced DI in context. This chapter goes deeper with
+> every concept fully demonstrated in standalone, runnable examples.
+> By the end you should understand not just how to register and inject,
+> but *why* the system works the way it does and how to handle every
+> edge case you will encounter in production.
 
-```bash
-dotnet new console -n DiLearn
-cd DiLearn
-# paste any example into Program.cs
-dotnet run
-```
+*Building on:* Ch 5 (interfaces), Ch 10 §10.1 (DI introduction),
+Ch 4 (extension methods — the registration pattern)
 
 ---
 
 ## 11.1 What the Container Actually Is
 
-Three objects do everything:
+The DI container (formally `IServiceProvider`) is a factory. It knows
+how to construct objects and how long to keep each one alive. When you
+ask it for an `IOrderService`, it:
+
+1. Looks up what implementation is registered for `IOrderService`
+2. Looks up all constructor parameters of that implementation
+3. Recursively constructs each parameter (which may have their own dependencies)
+4. Manages the lifetime of the resulting instances
+
+This construction of the entire dependency graph is called *resolution*.
+The container builds the tree bottom-up: leaf nodes (services with no
+dependencies) first, then the services that depend on them, up to the
+root (the service you actually asked for).
 
 ```
-IServiceCollection   — recipe book  (write at startup)
-IServiceProvider     — kitchen      (executes at runtime)
-ServiceDescriptor    — one record: "when asked for X, build Y with lifetime Z"
+Resolve: IOrderService
+  └── OrderService(IOrderRepo, IEmailSender, IPaymentGateway)
+        ├── EfOrderRepo(AppDbContext)
+        │      └── AppDbContext(DbContextOptions)
+        │              └── (options configured from IConfiguration)
+        ├── SmtpEmailSender(IOptions<SmtpOptions>)
+        │      └── (options resolved from configuration)
+        └── StripePaymentGateway(HttpClient, IOptions<StripeOptions>)
+               └── (HttpClient from IHttpClientFactory)
 ```
 
-```bash
-dotnet new console -n DiMinimal
-cd DiMinimal
-dotnet add package Microsoft.Extensions.DependencyInjection
-```
-
-```csharp
-// Program.cs — DI in its entirety, nothing hidden
-using Microsoft.Extensions.DependencyInjection;
-
-interface IGreeter        { void Greet(string name); }
-class ConsoleGreeter : IGreeter
-{
-    public void Greet(string name) => Console.WriteLine($"Hello, {name}!");
-}
-
-var services = new ServiceCollection();
-services.AddSingleton<IGreeter, ConsoleGreeter>();
-
-IServiceProvider provider = services.BuildServiceProvider();
-
-var greeter = provider.GetRequiredService<IGreeter>();
-greeter.Greet("World");
-// → Hello, World!
-```
+You declare the graph. The container traverses and builds it. You never
+call `new` on services that have dependencies.
 
 ---
 
-## 11.2 The Three Lifetimes
-
-```
-Scope 1 ────────────────────────────────────────
-  Singleton  S ── (born once, lives until app dies)
-  Scoped     A ── (born at scope open)
-  Transient  X    (new on every resolve)
-  Transient  Y    (different instance from X)
-[scope 1 ends]  A, X, Y disposed
-
-Scope 2 ────────────────────────────────────────
-  Singleton  S ── (same S as scope 1)
-  Scoped     B ── (new instance)
-  Transient  Z    (new instance)
-[scope 2 ends]  B, Z disposed
-```
-
-| Lifetime | New instance | Disposed |
-|---|---|---|
-| `Singleton` | Once ever | App shutdown |
-| `Scoped` | Once per scope / request | End of scope |
-| `Transient` | Every resolve | End of scope |
-
-```bash
-dotnet new console -n DiLifetimes
-cd DiLifetimes
-dotnet add package Microsoft.Extensions.DependencyInjection
-```
+## 11.2 The Three Lifetimes — What Actually Happens
 
 ```csharp
-// Program.cs — see lifetimes with your own eyes
-using Microsoft.Extensions.DependencyInjection;
-
-class SingletonService { public Guid Id { get; } = Guid.NewGuid(); }
-class ScopedService    { public Guid Id { get; } = Guid.NewGuid(); }
-class TransientService { public Guid Id { get; } = Guid.NewGuid(); }
-
-var services = new ServiceCollection();
-services.AddSingleton<SingletonService>();
-services.AddScoped<ScopedService>();
-services.AddTransient<TransientService>();
-
-var provider = services.BuildServiceProvider();
-
-for (int i = 1; i <= 2; i++)
-{
-    Console.WriteLine($"\n── Scope {i} ──");
-    using var scope = provider.CreateScope();
-    var sp = scope.ServiceProvider;
-
-    Console.WriteLine($"Singleton : {sp.GetRequiredService<SingletonService>().Id}");
-    Console.WriteLine($"Singleton : {sp.GetRequiredService<SingletonService>().Id}  ← same");
-    Console.WriteLine($"Scoped    : {sp.GetRequiredService<ScopedService>().Id}");
-    Console.WriteLine($"Scoped    : {sp.GetRequiredService<ScopedService>().Id}  ← same in scope");
-    Console.WriteLine($"Transient : {sp.GetRequiredService<TransientService>().Id}");
-    Console.WriteLine($"Transient : {sp.GetRequiredService<TransientService>().Id}  ← different!");
-}
-```
-
-### The Captive Dependency Bug
-
-A Singleton holding a Scoped service. The Scoped gets disposed; the Singleton holds a dead reference. Silent until runtime.
-
-```csharp
-// ❌ Bug: Singleton captures a Scoped — Scoped gets disposed,
-//         Singleton holds a dead reference, crashes later
-class BadSingleton
-{
-    private readonly ScopedService _scoped;  // will be disposed!
-    public BadSingleton(ScopedService scoped) => _scoped = scoped;
-}
-
-services.AddSingleton<BadSingleton>();
-services.AddScoped<ScopedService>();
-// Rider warns: yellow squiggle on the constructor parameter
-
-// ✅ Fix: inject IServiceScopeFactory, create scope on demand
-class GoodSingleton
-{
-    private readonly IServiceScopeFactory _factory;
-    public GoodSingleton(IServiceScopeFactory factory) => _factory = factory;
-
-    public void DoWork()
-    {
-        using var scope = _factory.CreateScope();
-        var scoped = scope.ServiceProvider.GetRequiredService<ScopedService>();
-        // scoped disposed when scope disposes — correct
-    }
-}
-```
-
----
-
-## 11.3 Constructor Injection
-
-```bash
-dotnet new console -n DiConstructor
-cd DiConstructor
-dotnet add package Microsoft.Extensions.DependencyInjection
-```
-
-```csharp
-// Program.cs — full injection chain, container resolves everything
-using Microsoft.Extensions.DependencyInjection;
-
-interface IMessageStore  { void Save(string m); IReadOnlyList<string> GetAll(); }
-interface INotifier      { void Notify(string m); }
-interface IMessageService{ void Send(string m); }
-
-class InMemoryStore : IMessageStore
-{
-    private readonly List<string> _items = new();
-    public void Save(string m)              => _items.Add(m);
-    public IReadOnlyList<string> GetAll()   => _items.AsReadOnly();
-}
-
-class ConsoleNotifier : INotifier
-{
-    public void Notify(string m) => Console.WriteLine($"[NOTIFY] {m}");
-}
-
-class MessageService : IMessageService
-{
-    private readonly IMessageStore _store;
-    private readonly INotifier     _notifier;
-
-    // Container resolves both parameters automatically
-    public MessageService(IMessageStore store, INotifier notifier)
-    { _store = store; _notifier = notifier; }
-
-    public void Send(string m) { _store.Save(m); _notifier.Notify(m); }
-}
-
-var services = new ServiceCollection();
-services.AddSingleton<IMessageStore,   InMemoryStore>();
-services.AddSingleton<INotifier,       ConsoleNotifier>();
-services.AddSingleton<IMessageService, MessageService>();
-
-var provider = services.BuildServiceProvider();
-var svc      = provider.GetRequiredService<IMessageService>();
-
-svc.Send("Hello DI");
-svc.Send("Second message");
-
-Console.WriteLine($"\nStored: {provider.GetRequiredService<IMessageStore>().GetAll().Count}");
-// → [NOTIFY] Hello DI
-// → [NOTIFY] Second message
-// → Stored: 2
-```
-
----
-
-## 11.4 Swapping Implementations
-
-```bash
-dotnet new console -n DiSwap
-cd DiSwap
-dotnet add package Microsoft.Extensions.DependencyInjection
-```
-
-```csharp
-// Program.cs
-using Microsoft.Extensions.DependencyInjection;
-
-interface IGreeter { string Greet(string name); }
-
-class FriendlyGreeter : IGreeter { public string Greet(string n) => $"Hey {n}! 👋"; }
-class FormalGreeter   : IGreeter { public string Greet(string n) => $"Good day, {n}."; }
-
-class WelcomeService
-{
-    private readonly IGreeter _greeter;
-    public WelcomeService(IGreeter g) => _greeter = g;
-    public void Welcome(string n) => Console.WriteLine(_greeter.Greet(n));
-}
-
-// One line change — WelcomeService never changes
-bool formal = args.Contains("--formal");
-
-var services = new ServiceCollection();
-services.AddSingleton<IGreeter>(formal ? new FormalGreeter() : new FriendlyGreeter());
-services.AddSingleton<WelcomeService>();
-
-var provider = services.BuildServiceProvider();
-var welcome  = provider.GetRequiredService<WelcomeService>();
-
-welcome.Welcome("Alice");
-welcome.Welcome("Bob");
-
-// dotnet run           → Hey Alice! 👋 / Hey Bob! 👋
-// dotnet run --formal  → Good day, Alice. / Good day, Bob.
-```
-
----
-
-## 11.5 Extension Methods — Self-Registration Pattern
-
-Each layer owns its own registrations. Composition root only calls extension methods.
-
-```bash
-dotnet new console -n DiExtensions
-cd DiExtensions
+// Start fresh
+dotnet new console -n DependencyLifetimes
 dotnet add package Microsoft.Extensions.Hosting
 ```
 
 ```csharp
-// Program.cs
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-
-interface IRepository   { void Save(string item); IReadOnlyList<string> GetAll(); }
-interface IEmailSender  { void Send(string to, string body); }
-interface IOrderService { void PlaceOrder(string item, string email); }
-
-class InMemoryRepository : IRepository
+// Demonstrates all three lifetimes with the same interface
+public interface IOperation
 {
-    private readonly List<string> _items = new();
-    public void Save(string item)         => _items.Add(item);
-    public IReadOnlyList<string> GetAll() => _items.AsReadOnly();
+    string Id { get; }   // unique per instance — shows when a new one is created
 }
 
-class ConsoleEmailSender : IEmailSender
+// All three use the same interface, different registration
+public class TransientOperation  : IOperation { public string Id { get; } = Guid.NewGuid().ToString("N")[..8]; }
+public class ScopedOperation     : IOperation { public string Id { get; } = Guid.NewGuid().ToString("N")[..8]; }
+public class SingletonOperation  : IOperation { public string Id { get; } = Guid.NewGuid().ToString("N")[..8]; }
+
+public class OperationLogger(
+    TransientOperation  transient,
+    ScopedOperation     scoped,
+    SingletonOperation  singleton)
 {
-    public void Send(string to, string body) =>
-        Console.WriteLine($"[EMAIL → {to}] {body}");
+    public void Log() =>
+        Console.WriteLine($"Transient: {transient.Id}, Scoped: {scoped.Id}, Singleton: {singleton.Id}");
 }
-
-class OrderService : IOrderService
-{
-    private readonly IRepository  _repo;
-    private readonly IEmailSender _email;
-    public OrderService(IRepository r, IEmailSender e) { _repo = r; _email = e; }
-    public void PlaceOrder(string item, string email)
-    {
-        _repo.Save(item);
-        _email.Send(email, $"Order confirmed: {item}");
-    }
-}
-
-// Each layer registers itself — nobody touches another layer's internals
-static class DataLayer  { public static IServiceCollection AddData(this IServiceCollection s)
-    => s.AddSingleton<IRepository, InMemoryRepository>(); }
-
-static class InfraLayer { public static IServiceCollection AddInfra(this IServiceCollection s)
-    => s.AddSingleton<IEmailSender, ConsoleEmailSender>(); }
-
-static class AppLayer   { public static IServiceCollection AddApp(this IServiceCollection s)
-    => s.AddSingleton<IOrderService, OrderService>(); }
-
-// Composition root — three lines, knows everything, does almost nothing
-var host = Host.CreateDefaultBuilder(args)
-    .ConfigureServices(s => s.AddData().AddInfra().AddApp())
-    .Build();
-
-var orders = host.Services.GetRequiredService<IOrderService>();
-orders.PlaceOrder("Keyboard", "alice@example.com");
-orders.PlaceOrder("Monitor",  "bob@example.com");
-
-// → [EMAIL → alice@example.com] Order confirmed: Keyboard
-// → [EMAIL → bob@example.com] Order confirmed: Monitor
-```
-
----
-
-## 11.6 IServiceProvider vs IServiceCollection
-
-```
-IServiceCollection                   IServiceProvider
-──────────────────                   ────────────────
-Write-only                           Read-only
-Lives at startup                     Lives at runtime
-.Add*() goes here                    .GetRequiredService<T>() goes here
-Recipe book                          Kitchen executing recipes
-```
-
-Injecting `IServiceProvider` into a service is the **Service Locator antipattern** —
-hides dependencies, breaks testability. The one legitimate use: Singleton needs Scoped:
-
-```bash
-dotnet new console -n DiScopeFactory
-cd DiScopeFactory
-dotnet add package Microsoft.Extensions.DependencyInjection
 ```
 
 ```csharp
 // Program.cs
-using Microsoft.Extensions.DependencyInjection;
-
-interface IRequestHandler { void Handle(string r); }
-
-class RequestHandler : IRequestHandler, IDisposable
-{
-    private static int _n = 0;
-    private readonly int _id = ++_n;
-    public void Handle(string r) => Console.WriteLine($"  Handler #{_id}: {r}");
-    public void Dispose()        => Console.WriteLine($"  Handler #{_id} disposed");
-}
-
-class RequestProcessor
-{
-    private readonly IServiceScopeFactory _factory;
-    public RequestProcessor(IServiceScopeFactory f) => _factory = f;
-
-    public void Process(string r)
-    {
-        Console.WriteLine($"Processing '{r}'");
-        using var scope = _factory.CreateScope();
-        scope.ServiceProvider.GetRequiredService<IRequestHandler>().Handle(r);
-        // scope closes → handler disposed
-    }
-}
-
 var services = new ServiceCollection();
-services.AddSingleton<RequestProcessor>();
-services.AddScoped<IRequestHandler, RequestHandler>();
+services.AddTransient<TransientOperation>();
+services.AddScoped<ScopedOperation>();
+services.AddSingleton<SingletonOperation>();
+services.AddTransient<OperationLogger>();
 
-var provider  = services.BuildServiceProvider();
-var processor = provider.GetRequiredService<RequestProcessor>();
-processor.Process("login");
-processor.Process("logout");
+await using var provider = services.BuildServiceProvider();
 
-// → Processing 'login'
-// →   Handler #1: login
-// →   Handler #1 disposed
-// → Processing 'logout'
-// →   Handler #2: logout
-// →   Handler #2 disposed
+Console.WriteLine("=== Scope 1 ===");
+await using (var scope1 = provider.CreateAsyncScope())
+{
+    // Within the same scope, Scoped is the same instance
+    var logger1 = scope1.ServiceProvider.GetRequiredService<OperationLogger>();
+    var logger2 = scope1.ServiceProvider.GetRequiredService<OperationLogger>();
+    logger1.Log();
+    logger2.Log();
+    // Output shows: Transient IDs differ, Scoped ID same, Singleton ID same
+}
+
+Console.WriteLine("=== Scope 2 ===");
+await using (var scope2 = provider.CreateAsyncScope())
+{
+    // New scope: Scoped gets a new instance
+    // Transient always new, Singleton always same
+    var logger3 = scope2.ServiceProvider.GetRequiredService<OperationLogger>();
+    logger3.Log();
+    // Output shows: Transient ID new, Scoped ID new (new scope!), Singleton same
+}
 ```
+
+Running this makes the lifetime behaviour concrete: Scoped creates a new
+instance per scope (per request in ASP.NET Core), while Singleton truly
+lives for the entire process lifetime.
 
 ---
 
-## 11.7 IOptions — Typed Configuration
+## 11.3 Constructor Injection — The Only Right Way
 
-```bash
-dotnet new console -n DiOptions
-cd DiOptions
-dotnet add package Microsoft.Extensions.Hosting
-dotnet add package Microsoft.Extensions.Options.DataAnnotations
+Constructor injection is the preferred mechanism. It makes dependencies
+explicit and visible, enables immutability, and allows the compiler to
+catch missing dependencies.
+
+```csharp
+// Good: dependencies declared in constructor, stored as readonly
+public class CustomerService(
+    ICustomerRepository repo,
+    IEmailSender         email,
+    ILogger<CustomerService> logger)
+{
+    // Primary constructor captures these as private fields automatically (C# 12)
+    // They are in scope throughout the class
+
+    public async Task<Customer> CreateAsync(
+        string name, string email2, CancellationToken ct)
+    {
+        logger.LogInformation("Creating customer {Name}", name);
+        var customer = Customer.Create(name, email2);
+        await repo.AddAsync(customer, ct);
+        await email.SendWelcomeAsync(customer.Email, ct);
+        return customer;
+    }
+}
 ```
 
-```json
-// appsettings.json
+Avoid property injection (setting properties after construction) and
+service locator (calling `IServiceProvider.GetService<T>()` inside
+a service). Both obscure dependencies and make testing harder.
+
+---
+
+## 11.4 Swapping Implementations — The Core Value Proposition
+
+The power of DI is that you can change which implementation is provided
+without changing any consumer code. This is most valuable for:
+
+- **Testing**: replace expensive or network-dependent services with fakes
+- **Feature flags**: swap implementations based on configuration
+- **Environment**: different implementations per Development/Production
+
+```csharp
+// Three implementations of the same interface
+public interface INotificationSender
 {
-  "Smtp": {
-    "Host": "smtp.example.com",
-    "Port": 587,
-    "TimeoutSeconds": 30
-  }
+    Task SendAsync(string message, CancellationToken ct);
+}
+
+public class SmtpNotificationSender  : INotificationSender { /* real SMTP */ }
+public class SmsNotificationSender   : INotificationSender { /* real SMS */ }
+public class ConsoleNotificationSender : INotificationSender
+{
+    public Task SendAsync(string message, CancellationToken ct)
+    {
+        Console.WriteLine($"[NOTIFICATION] {message}");
+        return Task.CompletedTask;
+    }
 }
 ```
 
 ```csharp
-// Program.cs
-using System.ComponentModel.DataAnnotations;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
-
-class SmtpOptions
+// Swap via environment configuration
+services.AddScoped<INotificationSender>(provider =>
 {
-    public const string Section = "Smtp";
-    [Required] public string Host           { get; set; } = "";
-    [Range(1, 65535)] public int Port       { get; set; } = 587;
-    [Range(1, 300)]   public int TimeoutSeconds { get; set; } = 30;
-}
+    var config   = provider.GetRequiredService<IConfiguration>();
+    var channel  = config["Notifications:Channel"] ?? "console";
 
-class EmailService
-{
-    private readonly SmtpOptions _opts;
-    public EmailService(IOptions<SmtpOptions> opts) => _opts = opts.Value;
-    public void Send(string to) =>
-        Console.WriteLine($"Sending to {to} via {_opts.Host}:{_opts.Port}");
-}
-
-var host = Host.CreateDefaultBuilder(args)
-    .ConfigureServices((ctx, s) =>
+    return channel switch
     {
-        s.AddOptions<SmtpOptions>()
-         .BindConfiguration(SmtpOptions.Section)
-         .ValidateDataAnnotations()
-         .ValidateOnStart();  // fail at startup, not first use
-        s.AddSingleton<EmailService>();
-    })
-    .Build();
-
-host.Services.GetRequiredService<EmailService>().Send("alice@example.com");
-// → Sending to alice@example.com via smtp.example.com:587
+        "smtp" => new SmtpNotificationSender(provider.GetRequiredService<IOptions<SmtpOptions>>()),
+        "sms"  => new SmsNotificationSender(provider.GetRequiredService<IOptions<SmsOptions>>()),
+        _      => new ConsoleNotificationSender()
+    };
+});
 ```
-
-| Interface | Reloads | Use when |
-|---|---|---|
-| `IOptions<T>` | Never | Fixed for app lifetime |
-| `IOptionsSnapshot<T>` | Per scope | May change between requests |
-| `IOptionsMonitor<T>` | Live callback | React to changes immediately |
 
 ---
 
-## 11.8 Multiple Implementations
+## 11.5 Extension Methods — The Self-Registration Pattern
 
-```bash
-dotnet new console -n DiMultiple
-cd DiMultiple
-dotnet add package Microsoft.Extensions.DependencyInjection
-```
+When a library registers several related services, it should expose a
+single `AddX(this IServiceCollection services)` extension method. This
+is the pattern used by every framework and library in the .NET ecosystem:
+`AddAuthentication()`, `AddEntityFrameworkCore()`, `AddSignalR()`.
 
 ```csharp
-// Program.cs — IEnumerable<T> injection: all registered implementations
-using Microsoft.Extensions.DependencyInjection;
-
-interface IValidator { (bool ok, string error) Validate(string input); }
-
-class NotEmptyValidator  : IValidator { public (bool, string) Validate(string s) =>
-    string.IsNullOrWhiteSpace(s) ? (false, "Cannot be empty") : (true, ""); }
-
-class MaxLengthValidator : IValidator { public (bool, string) Validate(string s) =>
-    s.Length > 20 ? (false, $"Too long ({s.Length}/20)") : (true, ""); }
-
-class NoDigitsValidator  : IValidator { public (bool, string) Validate(string s) =>
-    s.Any(char.IsDigit) ? (false, "No digits allowed") : (true, ""); }
-
-class InputValidator
+// Sync.Mesh Core — all core services in one call
+public static IServiceCollection AddSyncMeshCore(this IServiceCollection services)
 {
-    private readonly IEnumerable<IValidator> _validators;
-    public InputValidator(IEnumerable<IValidator> v) => _validators = v;
+    services.AddSingleton<SyncEngine>();
+    services.AddScoped<ConflictResolver>();
+    services.AddScoped<SnapshotDiff>();
+    services.AddScoped<PairingService>();
+    services.AddScoped<FeatureGate>();
+    return services;
+}
 
-    public bool Validate(string input)
+// Consumer: self-documenting, no knowledge of internals needed
+builder.Services.AddSyncMeshCore();
+```
+
+---
+
+## 11.6 `IServiceProvider` vs `IServiceCollection`
+
+Understanding the difference prevents a common confusion:
+
+- `IServiceCollection` is the *builder* — you add registrations to it at
+  startup. It is mutable. You only interact with it in `Program.cs` or
+  extension methods.
+
+- `IServiceProvider` is the built container — you resolve services from
+  it at runtime. It is immutable. You only access it when constructing
+  services (through constructor injection) or in factory delegates.
+
+Directly injecting `IServiceProvider` into a service (service locator
+pattern) is an anti-pattern — it hides dependencies and makes the service
+impossible to test without a full container. Use it only in factories or
+middleware where you need to resolve services dynamically:
+
+```csharp
+// Legitimate: factory method that creates a service per-operation
+public class ReportFactory(IServiceProvider provider)
+{
+    public IReport Create(ReportType type) => type switch
     {
-        bool ok = true;
-        foreach (var v in _validators)
+        ReportType.Pdf  => provider.GetRequiredService<PdfReport>(),
+        ReportType.Excel => provider.GetRequiredService<ExcelReport>(),
+        _ => throw new ArgumentException($"Unknown type {type}")
+    };
+}
+```
+
+---
+
+## 11.7 Multiple Implementations — Resolving All of Them
+
+When multiple implementations of the same interface are registered, you
+can inject `IEnumerable<T>` to get all of them. This is the basis of
+plugin systems, pipeline steps, and the Chain of Responsibility pattern:
+
+```csharp
+// Multiple validators
+services.AddTransient<IOrderValidator, PriceValidator>();
+services.AddTransient<IOrderValidator, StockValidator>();
+services.AddTransient<IOrderValidator, FraudValidator>();
+
+// Inject all validators
+public class OrderService(IEnumerable<IOrderValidator> validators)
+{
+    public async Task<ValidationResult> ValidateAsync(Order order, CancellationToken ct)
+    {
+        var errors = new List<string>();
+        foreach (var validator in validators)
         {
-            var (valid, error) = v.Validate(input);
-            if (!valid) { Console.WriteLine($"  ✗ {error}"); ok = false; }
+            var result = await validator.ValidateAsync(order, ct);
+            if (!result.IsValid)
+                errors.AddRange(result.Errors);
         }
-        return ok;
-    }
-}
-
-var services = new ServiceCollection();
-services.AddSingleton<IValidator, NotEmptyValidator>();
-services.AddSingleton<IValidator, MaxLengthValidator>();
-services.AddSingleton<IValidator, NoDigitsValidator>();
-services.AddSingleton<InputValidator>();
-
-var validator = services.BuildServiceProvider().GetRequiredService<InputValidator>();
-
-foreach (var input in new[] { "Alice", "", "Alice123", new string('x', 25) })
-{
-    Console.WriteLine($"\n'{input}'");
-    Console.WriteLine(validator.Validate(input) ? "  ✓ valid" : "  → invalid");
-}
-// Add a new rule: one new class + one AddSingleton. InputValidator never changes.
-```
-
----
-
-## 11.9 Testing With DI
-
-```bash
-dotnet new xunit -n DiTesting
-cd DiTesting
-dotnet add package Microsoft.Extensions.DependencyInjection
-dotnet add package NSubstitute
-```
-
-```csharp
-// UnitTest1.cs
-using Microsoft.Extensions.DependencyInjection;
-using NSubstitute;
-using Xunit;
-
-interface IEmailSender { void Send(string to, string subject); }
-interface IUserStore   { void Save(string name); bool Exists(string name); }
-
-class UserService
-{
-    private readonly IUserStore   _store;
-    private readonly IEmailSender _email;
-    public UserService(IUserStore s, IEmailSender e) { _store = s; _email = e; }
-
-    public bool Register(string name, string email)
-    {
-        if (_store.Exists(name)) return false;
-        _store.Save(name);
-        _email.Send(email, $"Welcome, {name}!");
-        return true;
-    }
-}
-
-public class UserServiceTests
-{
-    // Direct construction — preferred for unit tests, no container overhead
-    [Fact]
-    public void Register_NewUser_SavesAndSendsEmail()
-    {
-        var store = Substitute.For<IUserStore>();
-        var email = Substitute.For<IEmailSender>();
-        store.Exists("alice").Returns(false);
-
-        var svc = new UserService(store, email);
-        Assert.True(svc.Register("alice", "alice@example.com"));
-
-        store.Received(1).Save("alice");
-        email.Received(1).Send("alice@example.com", Arg.Any<string>());
-    }
-
-    [Fact]
-    public void Register_ExistingUser_ReturnsFalse()
-    {
-        var store = Substitute.For<IUserStore>();
-        var email = Substitute.For<IEmailSender>();
-        store.Exists("alice").Returns(true);
-
-        var svc = new UserService(store, email);
-        Assert.False(svc.Register("alice", "alice@example.com"));
-        email.DidNotReceive().Send(Arg.Any<string>(), Arg.Any<string>());
+        return new ValidationResult(errors);
     }
 }
 ```
 
 ---
 
-## 11.10 BackgroundService + Scoped Dependencies
+## 11.8 Scoped Services in BackgroundService
 
-```bash
-dotnet new worker -n DiWorker
-cd DiWorker
-```
+This is one of the most common DI mistakes. `BackgroundService` is a
+Singleton (it lives for the application lifetime). You cannot inject a
+Scoped service directly into it — the Scoped service would be captured by
+the Singleton, making it effectively a Singleton too (the captive
+dependency bug from §10.1).
+
+The fix is to inject `IServiceScopeFactory` and create a scope per unit
+of work:
 
 ```csharp
-// Program.cs
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-
-interface IJobRepository { IReadOnlyList<string> GetPending(); void MarkDone(string job); }
-
-class FakeJobRepository : IJobRepository, IDisposable
+// WRONG: DbContext is Scoped, captured by the Singleton BackgroundService
+public class InvoiceProcessor(AppDbContext db) : BackgroundService
 {
-    private static readonly Queue<string> _jobs = new(["job-1", "job-2", "job-3"]);
-    private readonly ILogger<FakeJobRepository> _log;
-    public FakeJobRepository(ILogger<FakeJobRepository> log) => _log = log;
-    public IReadOnlyList<string> GetPending() => _jobs.ToList();
-    public void MarkDone(string job) { if (_jobs.TryDequeue(out var j)) _log.LogInformation("Done: {J}", j); }
-    public void Dispose() => _log.LogDebug("Repo disposed");
-}
-
-class JobWorker : BackgroundService
-{
-    private readonly IServiceScopeFactory _factory;
-    private readonly ILogger<JobWorker>   _log;
-    public JobWorker(IServiceScopeFactory f, ILogger<JobWorker> l) { _factory = f; _log = l; }
-
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
-        while (await timer.WaitForNextTickAsync(ct))
-        {
-            using var scope = _factory.CreateScope();
-            var repo        = scope.ServiceProvider.GetRequiredService<IJobRepository>();
-            var jobs        = repo.GetPending();
-            if (jobs.Count == 0) { _log.LogInformation("No pending jobs"); break; }
-            _log.LogInformation("Processing {N} jobs", jobs.Count);
-            foreach (var job in jobs) repo.MarkDone(job);
-        }
+        while (await _timer.WaitForNextTickAsync(ct))
+            await ProcessPendingInvoicesAsync(db, ct);  // same db instance forever
     }
 }
 
-await Host.CreateDefaultBuilder(args)
-    .ConfigureServices(s =>
+// CORRECT: create a new scope per execution cycle
+public class InvoiceProcessor(IServiceScopeFactory scopeFactory) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        s.AddScoped<IJobRepository, FakeJobRepository>();
-        s.AddHostedService<JobWorker>();
-    })
-    .Build()
-    .RunAsync();
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
+        while (await timer.WaitForNextTickAsync(ct))
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var db      = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var service = scope.ServiceProvider.GetRequiredService<IInvoiceService>();
+            await service.ProcessPendingAsync(ct);
+        }  // scope disposed here — DbContext freed, connection returned to pool
+    }
+}
 ```
 
 ---
 
-## 11.11 The Mental Model
+## 11.9 Testing With DI — Using the Real Container
 
-```
-IServiceCollection   — recipe book, write at startup, frozen after Build()
-IServiceProvider     — kitchen, read at runtime, lives forever
-Constructor params   — how ingredients arrive, never walk to the kitchen yourself
-Extension methods    — each layer self-registers, composition root calls them
-IServiceScopeFactory — the only legitimate reason to touch the provider at runtime
+For integration tests, you can build a test service collection that
+replaces specific services with fakes while using real implementations
+for everything else:
+
+```csharp
+// xUnit test
+public class OrderServiceTests
+{
+    private readonly FakeEmailSender _email = new();
+
+    private IOrderService CreateSut()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddDbContext<AppDbContext>(o => o.UseInMemoryDatabase("test"));
+        services.AddScoped<IOrderRepository, EfOrderRepository>();
+        services.AddScoped<IOrderService, OrderService>();
+
+        // Replace the real email sender with a fake
+        services.AddSingleton<IEmailSender>(_email);
+
+        var provider = services.BuildServiceProvider();
+        return provider.GetRequiredService<IOrderService>();
+    }
+
+    [Fact]
+    public async Task CreateOrder_sends_confirmation_email()
+    {
+        var sut = CreateSut();
+        await sut.CreateOrderAsync(new CreateOrderRequest { CustomerEmail = "alice@example.com" });
+
+        Assert.Single(_email.SentEmails);
+        Assert.Contains("alice@example.com", _email.SentEmails[0].To);
+    }
+}
 ```
 
+---
+
+## 11.10 The Mental Model — Summary
+
+DI is about two things:
+1. **Inversion of Control**: services declare their needs; the framework
+   provides them. The service does not look up its own dependencies.
+2. **Open/Closed Principle**: you can add new behaviour (new
+   implementations) without modifying existing services. The consumer
+   service does not change when you swap its dependency.
+
+Together these make systems modular, testable, and deployable to
+different environments without code changes — just different registrations
+in `Program.cs`.

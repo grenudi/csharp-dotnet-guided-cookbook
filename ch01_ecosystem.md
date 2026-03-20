@@ -1,62 +1,173 @@
 # Chapter 1 — The .NET Ecosystem
 
-## 1.1 What Is .NET?
-
-.NET is a free, open-source, cross-platform developer platform maintained by Microsoft and the community. It is *not* one thing — it is a family of runtimes, libraries, compilers, and SDKs.
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      Your Application                   │
-├─────────────────────────────────────────────────────────┤
-│          BCL — Base Class Library (mscorlib etc.)       │
-├─────────────────────────────────────────────────────────┤
-│     ASP.NET Core │ EF Core │ MAUI │ WinForms │ WPF      │
-├─────────────────────────────────────────────────────────┤
-│           CoreCLR / NativeAOT / Mono runtime            │
-├─────────────────────────────────────────────────────────┤
-│        OS: Linux │ Windows │ macOS │ Android │ iOS      │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Key Terms
-
-| Term | Meaning |
-|------|---------|
-| **CLR** | Common Language Runtime — the JIT-based VM that executes IL |
-| **IL / CIL** | Intermediate Language — what the C# compiler produces |
-| **BCL** | Base Class Library — `System.*` namespaces |
-| **SDK** | Software Development Kit — compiler + BCL + tooling |
-| **Runtime** | Just the CLR + BCL, no compiler |
-| **TFM** | Target Framework Moniker: `net9.0`, `net9.0-android`, `netstandard2.1` |
-| **RID** | Runtime Identifier: `linux-x64`, `win-arm64`, `osx-arm64` |
+> Before writing a single line of C#, you need a map. This chapter
+> explains what .NET actually is, how its parts relate, and how to
+> navigate the toolchain with confidence. Everything in later chapters
+> runs on top of what is described here. Understanding this stack
+> prevents a class of confusion that trips up developers for years.
 
 ---
 
-## 1.2 .NET Version Timeline
+## 1.1 What Is .NET?
+
+Most developers first encounter .NET as "the thing that runs C#". That
+framing is too narrow and leads to confusion when you hit terms like CLR,
+runtime, SDK, BCL, or TFM with no mental model to place them in.
+
+.NET is a *platform* — a stack of three distinct layers that together
+take your source code and turn it into a running process on any supported
+operating system:
 
 ```
-.NET Framework 1.0–4.8.x  ← Windows only, legacy (still supported, not recommended for new projects)
-.NET Core 1.0–3.1          ← cross-platform reboot (EOL)
-.NET 5                      ← unified, "Core" dropped
-.NET 6 LTS                  ← 3 years support, minimal APIs, hot reload
-.NET 7                      ← STS, performance leap (PGO)
-.NET 8 LTS                  ← 3 years support, Native AOT stable, Blazor SSR/WASM united
-.NET 9 STS                  ← current (Nov 2024), Task.WhenEach, SearchValues, more AOT
-.NET 10 LTS                 ← arriving Nov 2025 (preview available)
+┌──────────────────────────────────────────────────────────────┐
+│                      Your Application                        │
+│   Console │ Web API │ Desktop │ Mobile │ Embedded │ WASM     │
+├──────────────────────────────────────────────────────────────┤
+│   Application Frameworks — the wheel you do not reinvent     │
+│   ASP.NET Core │ EF Core │ MAUI │ WinForms │ WPF │ Blazor   │
+├──────────────────────────────────────────────────────────────┤
+│   BCL — Base Class Library                                   │
+│   System.* namespaces: collections, I/O, networking,         │
+│   threading, reflection, JSON, cryptography, dates, text…    │
+├──────────────────────────────────────────────────────────────┤
+│   Runtime — CoreCLR / NativeAOT / Mono                       │
+│   JIT compiler, garbage collector, thread scheduler,          │
+│   exception handling, type system, native interop            │
+├──────────────────────────────────────────────────────────────┤
+│   OS: Linux │ Windows │ macOS │ Android │ iOS │ WASM         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-**LTS = Long-Term Support (3 years). STS = Standard-Term Support (18 months).**
+**Layer 1 — The Runtime** is the execution engine. The C# compiler does
+*not* produce machine code directly. It produces IL (Intermediate
+Language) — a CPU-independent instruction set that is the same whether
+you compile on x64, ARM, or a Mac. The runtime's JIT (just-in-time)
+compiler translates IL to native machine code the first time each method
+is called. The same IL binary therefore runs on any supported platform
+without recompilation. This is how a `dotnet publish` on Linux can produce
+a binary that runs on macOS ARM. Beyond execution, the runtime owns the
+garbage collector that manages memory for you (Chapter 26), the type
+system that enforces types at runtime, and the interop bridges that allow
+calling native OS code.
 
-> **Rider tip:** *Help → About* shows which SDK Rider is using. Set the SDK per-project in *Project Properties → Framework*.
+**Layer 2 — The BCL** (Base Class Library) is the standard library that
+ships with every .NET installation. It provides the building blocks every
+program needs regardless of domain: `List<T>`, `Dictionary<K,V>`,
+`Stream`, `HttpClient`, `Task`, `JsonSerializer`, `Regex`, `File`,
+`Console`. The BCL is your first vocabulary as a C# developer. You will
+use it in every chapter of this book, every project you write.
+
+**Layer 3 — Application Frameworks** are optional and domain-specific.
+ASP.NET Core is for HTTP servers. EF Core is for relational databases.
+MAUI is for mobile and desktop. These are not part of the runtime — they
+are libraries built on top of the BCL. You choose which ones to include
+based on what your application does.
+
+This three-layer view matters because it tells you where blame lies when
+something goes wrong. A slow query is an EF Core (layer 3) or SQL issue.
+A memory leak is a runtime (layer 1) concern. A missing method is a BCL
+(layer 2) question. A startup crash is often a runtime misconfiguration.
+
+### The Vocabulary You Will See Everywhere
+
+| Term | What it actually means |
+|------|------------------------|
+| **CLR** | Common Language Runtime — the JIT-based VM that executes IL |
+| **IL / CIL** | Intermediate Language — the portable bytecode the C# compiler produces |
+| **JIT** | Just-In-Time compiler — translates IL to native machine code at runtime |
+| **GC** | Garbage Collector — automatic memory management (covered in depth in Ch 26) |
+| **BCL** | Base Class Library — `System.*` namespaces, available everywhere |
+| **SDK** | Software Development Kit — the `dotnet` compiler, BCL, and CLI tooling |
+| **Runtime** | Just the CLR + BCL, without the compiler — what production servers need |
+| **TFM** | Target Framework Moniker: `net9.0`, `net9.0-android`, `netstandard2.1` |
+| **RID** | Runtime Identifier: `linux-x64`, `win-arm64`, `osx-arm64` |
+| **NuGet** | The package manager for .NET — like npm for Node or cargo for Rust |
+
+The distinction between SDK and Runtime matters in deployment: your build
+machine needs the full SDK; your production server only needs the runtime,
+which is smaller and carries a smaller attack surface.
+
+---
+
+## 1.2 The Version History — Why There Are So Many Names
+
+If you have searched for a .NET error and found contradictory answers
+from 2011, 2016, and 2022, this section explains why. The history is
+messier than it should be. The current situation is clean.
+
+```
+.NET Framework 1.0–4.8.x  (2002–present)
+│  Windows-only. Ships as part of Windows. Will never be discontinued
+│  because too much enterprise software depends on it. Not recommended
+│  for new projects — it will receive security fixes but no new features.
+│  When you see "for .NET Framework" in a StackOverflow answer, most of
+│  it does not apply to modern .NET.
+│
+.NET Core 1.0–3.1         (2016–2019, now end-of-life)
+│  The cross-platform reboot. "Core" indicated a clean break from the
+│  Windows-only framework. Architected to run on Linux and macOS.
+│  Performance-focused. All versions now end-of-life.
+│
+.NET 5                    (2020)
+│  Unified: "Core" dropped from the name. One .NET to rule them all.
+│  The version jump from 4.x to 5 was intentional — avoids confusion
+│  with .NET Framework 4.8.
+│
+.NET 6 LTS                (2021, supported to May 2024)
+│  Minimal APIs for ASP.NET Core. Hot Reload in development. Blazor
+│  unified across server and client.
+│
+.NET 7 STS                (2022, now end-of-life)
+│  Major performance leap via PGO (Profile-Guided Optimization). The
+│  JIT learned to optimise based on observed runtime behavior.
+│
+.NET 8 LTS                (2023, supported to Nov 2026)
+│  Native AOT reaches production stability. Primary Constructors in C# 12.
+│  Blazor SSR + WebAssembly unified. System.Text.Json improvements.
+│  Most stable choice for production systems today.
+│
+.NET 9 STS                (2024, supported to May 2026)
+│  Current release. Task.WhenEach, SearchValues, LINQ improvements,
+│  HybridCache. Recommended for new projects where long-term support
+│  is not the primary concern.
+│
+.NET 10 LTS               (arriving Nov 2025, in preview at time of writing)
+   Three-year support lifecycle. Will be the next recommended LTS.
+```
+
+**LTS = Long-Term Support (3 years), even-numbered releases.**
+**STS = Standard-Term Support (18 months), odd-numbered releases.**
+
+For new projects: use the latest LTS unless you need a feature specific
+to the current STS. Both LTS and STS receive security updates for their
+entire support lifetime.
+
+The term ".NET Standard" (versions 1.0 through 2.1) appears in older
+library code. It was a compatibility contract that let a single library
+target both .NET Framework and .NET Core. It is largely obsolete now.
+New libraries target `net8.0` or `net9.0` directly, and use multi-
+targeting (`<TargetFrameworks>net9.0;net48</TargetFrameworks>`) for the
+rare case where Framework compatibility is still needed.
 
 ---
 
 ## 1.3 Installing the SDK
 
-### Linux (NixOS — recommended approach)
+The SDK is the `dotnet` command-line tool. It creates projects, builds,
+runs, tests, publishes, manages packages and tools, formats code, and
+generates code (EF migrations, OpenAPI clients). There is one binary,
+it is cross-platform, and it does everything.
+
+### Linux — NixOS (Recommended for Reproducibility)
+
+Nix pins the exact SDK version in a `flake.nix` file so every developer
+on the project gets identical tools regardless of what is installed
+globally on their machine. The environment activates per-directory via
+`direnv`. Nothing is installed globally — the environment disappears
+when you leave the directory. Chapter 22 covers Nix in depth.
 
 ```nix
-# flake.nix excerpt
+# flake.nix — minimal dev shell
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -65,9 +176,10 @@
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in pkgs.mkShell {
       packages = [
-        pkgs.dotnet-sdk_9   # includes runtime + SDK
-        pkgs.omnisharp-roslyn
-        pkgs.netcoredbg
+        pkgs.dotnet-sdk_9       # SDK 9 — includes the runtime, CLI, and BCL
+        pkgs.omnisharp-roslyn   # language server for editors
+        pkgs.netcoredbg         # debugger
+        pkgs.dotnet-ef          # EF Core CLI tool
       ];
       DOTNET_ROOT = "${pkgs.dotnet-sdk_9}";
     };
@@ -76,674 +188,429 @@
 ```
 
 ```bash
-# activate
-direnv allow
-dotnet --version   # 9.x.x
+direnv allow      # activates the shell; dotnet is now in PATH
+dotnet --version  # confirms the right version
 ```
 
-### Linux (apt / snap)
+### Linux — Manual Install
 
 ```bash
-# Ubuntu 24.04
-sudo apt install dotnet-sdk-9.0
+# Official Microsoft install script — installs to ~/.dotnet
+curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0
 
-# Or via Microsoft feed:
-wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
-sudo dpkg -i packages-microsoft-prod.deb
-sudo apt update && sudo apt install dotnet-sdk-9.0
+# Add to ~/.bashrc or ~/.zshrc
+export DOTNET_ROOT=$HOME/.dotnet
+export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
 ```
 
 ### Windows
 
 ```powershell
 winget install Microsoft.DotNet.SDK.9
+# Or download from https://dotnet.microsoft.com/download
 ```
 
 ### macOS
 
 ```bash
-brew install dotnet
+brew install dotnet@9
+# Or the official .pkg from https://dotnet.microsoft.com/download
 ```
 
 ### Verify
 
 ```bash
-dotnet --version          # e.g. 9.0.100
+dotnet --version          # e.g. 9.0.101
 dotnet --list-sdks        # all installed SDKs
 dotnet --list-runtimes    # all installed runtimes
 ```
 
 ---
 
-## 1.4 The dotnet CLI — Complete Reference
+## 1.4 The `dotnet` CLI — Complete Reference
 
-The `dotnet` CLI is the primary tool for creating, building, running, testing, and publishing .NET applications.
+The CLI is your primary interface with the entire .NET ecosystem. Rider
+and Visual Studio call it under the hood for every build, test, and
+publish operation. Understanding it gives you full visibility into what
+the IDE is doing and lets you automate anything in CI.
 
-### New Project / Solution
+### Creating Projects
+
+Templates are the starting point. Each template produces a project with
+the correct `.csproj`, `Program.cs`, and dependencies for its purpose.
 
 ```bash
-# List all available templates
+dotnet new console    -n MyApp           # console application
+dotnet new webapi     -n MyApi           # ASP.NET Core Web API
+dotnet new classlib   -n MyLib           # reusable class library
+dotnet new worker     -n MyWorker        # background service
+dotnet new blazorwasm -n MyBlazor        # Blazor WebAssembly
+dotnet new xunit      -n MyApp.Tests     # xUnit test project
+
+# See all templates
 dotnet new list
 
-# Common templates
-dotnet new console -n MyApp -o ./MyApp
-dotnet new classlib -n MyLib -o ./MyLib
-dotnet new web -n MyApi
-dotnet new webapi -n MyApi --use-controllers   # with controllers
-dotnet new minimal-api -n MyApi               # explicit minimal
-dotnet new worker -n MyDaemon
-dotnet new blazor -n MyBlazor                 # interactive Blazor
-dotnet new blazorwasm -n MyBlazorWasm
-dotnet new maui -n MyMaui
-dotnet new xunit -n MyTests
-dotnet new sln -n MySolution
-
-# Install additional templates
-dotnet new install "Avalonia.Templates"
-dotnet new install "Amazon.Lambda.Templates"
+# Create, navigate, run — the three-command start
+dotnet new console -n Hello && cd Hello && dotnet run
 ```
 
-### Solution Management
+### Building
+
+Building compiles C# source to IL and resolves NuGet packages. You
+almost never need to think about this separately from running, but
+understanding the difference between Debug and Release builds matters:
 
 ```bash
-dotnet sln MySolution.sln add src/MyApp/MyApp.csproj
-dotnet sln MySolution.sln add src/MyLib/MyLib.csproj
-dotnet sln MySolution.sln add tests/MyTests/MyTests.csproj
-dotnet sln MySolution.sln list
-dotnet sln MySolution.sln remove src/OldProject/OldProject.csproj
+dotnet build                     # Debug: no optimisations, full debug info
+dotnet build -c Release          # Release: JIT and compiler optimisations applied
+                                 # Benchmarks and production must use Release.
+dotnet build --no-restore        # skip NuGet restore if already done
 ```
 
-### Build & Run
+### Running and Testing
 
 ```bash
-dotnet build                        # debug build
-dotnet build -c Release             # release build
-dotnet build -c Release --no-restore
-dotnet run                          # build + run (debug)
-dotnet run -c Release               # build + run (release)
-dotnet run -- --port 8080           # pass args after --
-dotnet watch run                    # hot reload
-dotnet watch test                   # run tests on save
+dotnet run                           # build + run the project in current dir
+dotnet run --project src/MyApp       # specify which project
+dotnet run -- --port 8080            # -- separates dotnet args from program args
+
+dotnet test                          # run all test projects in the solution
+dotnet test -c Release --no-build    # use already-built Release output
+dotnet test --filter "Category=Unit" # run tests matching a filter
+
+dotnet watch run                     # rebuild and restart on any file change
+dotnet watch test                    # rerun tests on file change
 ```
 
-### NuGet / Package Management
+### Managing NuGet Packages
 
 ```bash
-dotnet add package Serilog
-dotnet add package Serilog --version 3.1.1
-dotnet add package Microsoft.EntityFrameworkCore.Sqlite --prerelease
+dotnet add package Serilog                    # add latest stable
+dotnet add package Serilog --version 3.1.1   # pin a version
 dotnet remove package Serilog
-dotnet list package
-dotnet list package --outdated
-dotnet list package --vulnerable       # security audit
-dotnet restore                         # restore all packages
-dotnet nuget locals all --clear        # clear NuGet cache
+
+dotnet list package                  # what is in this project
+dotnet list package --outdated       # which packages have newer versions
+dotnet list package --vulnerable     # which have known CVEs
 ```
 
-### Test
+### Publishing for Deployment
+
+Publishing prepares a release build for deployment. It is distinct from
+building: it resolves all dependencies, applies release-mode optimisations,
+and writes a deployable directory.
 
 ```bash
-dotnet test
-dotnet test -c Release
-dotnet test --filter "Category=Unit"
-dotnet test --filter "FullyQualifiedName~MyNamespace"
-dotnet test --logger "trx;LogFileName=results.trx"
-dotnet test --collect:"XPlat Code Coverage"
+# Framework-dependent: smallest output, but requires runtime on target machine
+dotnet publish -c Release -r linux-x64
+
+# Self-contained: includes the runtime — works on machines with no .NET installed
+dotnet publish -c Release -r linux-x64 --self-contained
+
+# Native AOT: compiles directly to a native binary — no JIT, no startup overhead
+# Trade-off: some dynamic features (reflection-heavy code) need adaption
+dotnet publish -c Release -r linux-x64 /p:PublishAot=true
+
+# Single-file: everything bundled into one executable
+dotnet publish -c Release -r linux-x64 /p:PublishSingleFile=true --self-contained
 ```
 
-### Publish
-
-```bash
-# Framework-dependent (requires runtime on target)
-dotnet publish -c Release -o ./publish
-
-# Self-contained (bundles runtime)
-dotnet publish -c Release -r linux-x64 --self-contained -o ./publish
-
-# Native AOT (compile to native binary)
-dotnet publish -c Release -r linux-x64 /p:PublishAot=true -o ./publish
-
-# Single file
-dotnet publish -c Release -r linux-x64 --self-contained /p:PublishSingleFile=true
-
-# Trimmed
-dotnet publish -c Release -r linux-x64 --self-contained /p:PublishTrimmed=true
-```
-
-### Diagnostics
-
-```bash
-dotnet-trace collect --process-id <pid>
-dotnet-counters monitor --process-id <pid>
-dotnet-dump collect --process-id <pid>
-dotnet-dump analyze ./core_20240101_120000.dmp
-dotnet-gcdump collect --process-id <pid>
-```
+Chapter 21 covers Native AOT in depth including what you need to change
+in your code to make it AOT-compatible.
 
 ---
 
-## 1.5 Project File (`.csproj`) Deep Dive
+## 1.5 The Project File (`.csproj`) — Demystified
 
-The `.csproj` is an MSBuild XML file. Understanding it is essential.
-
-### Minimal Console App
+Every .NET project is described by an XML file with the `.csproj`
+extension. MSBuild (the build engine) reads this file and translates it
+into a sequence of compilation steps. Understanding the most important
+properties removes all the "magic" from IDE project setup.
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Sdk="Microsoft.NET.Sdk" imports a huge set of default build targets.
+    For web projects: Sdk="Microsoft.NET.Sdk.Web"
+    For workers:      Sdk="Microsoft.NET.Sdk.Worker"
+    Each Sdk variant imports different defaults and sets different properties.
+  -->
+
   <PropertyGroup>
+    <!--
+      OutputType determines the kind of binary produced.
+      Exe     = runnable program with an entry point (console app, daemon)
+      Library = a .dll with no entry point (shared library)
+      WinExe  = a Windows GUI app; no console window appears on launch
+    -->
     <OutputType>Exe</OutputType>
+
+    <!--
+      TargetFramework selects which BCL and runtime you compile against.
+      This affects which APIs are available and which platform you run on.
+
+      net9.0          = .NET 9 for all platforms (recommended default)
+      net9.0-windows  = .NET 9 + Windows-specific APIs (WinForms, WPF, registry)
+      net9.0-android  = .NET 9 + Android APIs (for MAUI Android)
+      net9.0-ios      = .NET 9 + iOS APIs (for MAUI iOS)
+      netstandard2.1  = maximum compatibility with older frameworks (legacy only)
+
+      For multi-platform targets, use TargetFrameworks (plural):
+      <TargetFrameworks>net9.0;net8.0</TargetFrameworks>
+    -->
     <TargetFramework>net9.0</TargetFramework>
-    <Nullable>enable</Nullable>
+
+    <!--
+      ImplicitUsings adds a set of global using directives automatically
+      based on the project type. For console apps this includes:
+      System, System.Collections.Generic, System.IO, System.Linq,
+      System.Net.Http, System.Threading, System.Threading.Tasks, and more.
+      This eliminates 10+ boilerplate using lines from every file.
+    -->
     <ImplicitUsings>enable</ImplicitUsings>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
-    <LangVersion>latest</LangVersion>
-  </PropertyGroup>
-</Project>
-```
 
-### Class Library
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <!--
+      Nullable enables Nullable Reference Types (NRT), introduced in C# 8.
+      With this enabled, the compiler tracks whether a reference type can
+      hold null, and warns if you dereference a possibly-null value.
+      This eliminates an entire class of NullReferenceException bugs at
+      compile time rather than at runtime at 3am.
+      Chapter 2 §2.5 explains NRT in full.
+    -->
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <!-- Multi-target for NuGet packages: -->
-    <!-- <TargetFrameworks>net9.0;net8.0;netstandard2.1</TargetFrameworks> -->
-  </PropertyGroup>
-</Project>
-```
-
-### Web API / ASP.NET Core
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk.Web">
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <InvariantGlobalization>true</InvariantGlobalization> <!-- smaller binary -->
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.0" />
-  </ItemGroup>
-</Project>
-```
+    <!--
+      PackageReference declares a NuGet dependency.
+      The Version attribute pins the exact version.
+      dotnet restore downloads it from nuget.org into a local cache.
 
-### Full-Featured Production Project
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <!-- Framework & Language -->
-    <TargetFramework>net9.0</TargetFramework>
-    <LangVersion>latest</LangVersion>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-
-    <!-- Warnings as errors in CI -->
-    <TreatWarningsAsErrors>$(CI)</TreatWarningsAsErrors>
-    <WarningsAsErrors />
-    <!-- Suppress specific warnings -->
-    <NoWarn>CS1591</NoWarn>   <!-- missing XML doc -->
-
-    <!-- Analyzer strictness -->
-    <AnalysisMode>Recommended</AnalysisMode>
-    <EnableNETAnalyzers>true</EnableNETAnalyzers>
-
-    <!-- NuGet package metadata (for library projects) -->
-    <PackageId>Acme.MyLib</PackageId>
-    <Version>1.0.0</Version>
-    <Authors>Your Name</Authors>
-    <Description>Does something useful</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/you/mylib</RepositoryUrl>
-    <GenerateDocumentationFile>true</GenerateDocumentationFile>
-
-    <!-- Publish -->
-    <PublishReadyToRun>true</PublishReadyToRun>
-    <RuntimeIdentifiers>linux-x64;win-x64;osx-arm64</RuntimeIdentifiers>
-  </PropertyGroup>
-
-  <!-- Central package versions (if using CPM) -->
-  <!-- <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally> -->
-
-  <ItemGroup>
-    <PackageReference Include="Serilog" Version="3.1.1" />
+      In a solution using Central Package Management (Directory.Packages.props),
+      the Version attribute is omitted here and specified centrally.
+    -->
+    <PackageReference Include="Serilog"               Version="3.1.1" />
     <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
   </ItemGroup>
 
-  <!-- Project reference -->
   <ItemGroup>
-    <ProjectReference Include="../MyLib/MyLib.csproj" />
+    <!--
+      ProjectReference declares a dependency on another project in the solution.
+      The build system ensures MyApp.Core is compiled before MyApp.Web.
+      No version needed — it always uses the current source.
+    -->
+    <ProjectReference Include="..\MyApp.Core\MyApp.Core.csproj" />
   </ItemGroup>
 
-  <!-- Embed files -->
-  <ItemGroup>
-    <EmbeddedResource Include="Resources/**/*" />
-    <None Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <!-- Conditional: Debug only -->
-  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
-    <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="9.0.0" />
-  </ItemGroup>
 </Project>
-```
-
-### Directory.Build.props — Shared Settings
-
-Place `Directory.Build.props` at the solution root to apply settings to **all** projects:
-
-```xml
-<!-- Directory.Build.props -->
-<Project>
-  <PropertyGroup>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <LangVersion>latest</LangVersion>
-    <TreatWarningsAsErrors>$(CI)</TreatWarningsAsErrors>
-    <AnalysisMode>Recommended</AnalysisMode>
-    <Authors>Acme Corp</Authors>
-    <Copyright>Copyright © 2025 Acme Corp</Copyright>
-  </PropertyGroup>
-</Project>
-```
-
-### Directory.Packages.props — Central Package Management
-
-```xml
-<!-- Directory.Packages.props -->
-<Project>
-  <PropertyGroup>
-    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-  </PropertyGroup>
-  <ItemGroup>
-    <!-- Define versions centrally; reference without Version in each .csproj -->
-    <PackageVersion Include="Serilog" Version="3.1.1" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
-    <PackageVersion Include="xunit" Version="2.9.0" />
-    <PackageVersion Include="NSubstitute" Version="5.1.0" />
-  </ItemGroup>
-</Project>
-```
-
-Then in each `.csproj`:
-
-```xml
-<PackageReference Include="Serilog" />  <!-- no Version attribute needed -->
 ```
 
 ---
 
-## 1.6 Global Usings
+## 1.6 Solution-Level Configuration — `global.json` and `Directory.Build.props`
 
-With `<ImplicitUsings>enable</ImplicitUsings>`, the SDK automatically adds common usings based on project type. You can add your own in a `GlobalUsings.cs` file:
+### `global.json` — Pinning the SDK Version
 
-```csharp
-// GlobalUsings.cs
-global using System.Text.Json;
-global using System.Diagnostics;
-global using Microsoft.Extensions.Logging;
-global using MyApp.Domain;
-global using MyApp.Infrastructure;
-```
-
-You can also declare them in the `.csproj`:
-
-```xml
-<ItemGroup>
-  <Using Include="System.Text.Json" />
-  <Using Include="MyApp.Domain" />
-  <!-- Alias -->
-  <Using Include="System.Collections.Generic.List`1" Alias="List" />
-</ItemGroup>
-```
-
----
-
-## 1.7 Solution Structure Patterns
-
-### Pattern A — Simple App (small team / single service)
-
-```
-MyApp/
-├── MyApp.sln
-├── Directory.Build.props
-├── Directory.Packages.props
-├── .gitignore
-├── README.md
-└── src/
-    └── MyApp/
-        ├── MyApp.csproj
-        ├── Program.cs
-        ├── Domain/
-        │   ├── Entities/
-        │   └── ValueObjects/
-        ├── Application/
-        │   ├── Commands/
-        │   └── Queries/
-        ├── Infrastructure/
-        │   ├── Persistence/
-        │   └── Http/
-        └── Presentation/
-            └── Endpoints/
-```
-
-### Pattern B — Clean Architecture (medium project)
-
-```
-Acme.Orders/
-├── Acme.Orders.sln
-├── Directory.Build.props
-├── Directory.Packages.props
-├── global.json
-├── .editorconfig
-├── src/
-│   ├── Acme.Orders.Domain/           ← entities, value objects, domain events, no deps
-│   │   ├── Acme.Orders.Domain.csproj
-│   │   ├── Entities/
-│   │   │   └── Order.cs
-│   │   ├── ValueObjects/
-│   │   │   └── Money.cs
-│   │   ├── Events/
-│   │   │   └── OrderPlaced.cs
-│   │   └── Repositories/
-│   │       └── IOrderRepository.cs   ← interfaces defined here
-│   │
-│   ├── Acme.Orders.Application/      ← use cases, CQRS, no framework deps
-│   │   ├── Acme.Orders.Application.csproj
-│   │   ├── Commands/
-│   │   │   ├── PlaceOrder/
-│   │   │   │   ├── PlaceOrderCommand.cs
-│   │   │   │   ├── PlaceOrderHandler.cs
-│   │   │   │   └── PlaceOrderValidator.cs
-│   │   └── Queries/
-│   │       └── GetOrder/
-│   │           ├── GetOrderQuery.cs
-│   │           └── GetOrderHandler.cs
-│   │
-│   ├── Acme.Orders.Infrastructure/   ← EF Core, HttpClient, file system, etc.
-│   │   ├── Acme.Orders.Infrastructure.csproj
-│   │   ├── Persistence/
-│   │   │   ├── AppDbContext.cs
-│   │   │   ├── Migrations/
-│   │   │   └── Repositories/
-│   │   │       └── OrderRepository.cs
-│   │   └── Http/
-│   │       └── PaymentGatewayClient.cs
-│   │
-│   └── Acme.Orders.Api/              ← ASP.NET Core, entry point
-│       ├── Acme.Orders.Api.csproj
-│       ├── Program.cs
-│       └── Endpoints/
-│           └── OrderEndpoints.cs
-│
-└── tests/
-    ├── Acme.Orders.Domain.Tests/
-    ├── Acme.Orders.Application.Tests/
-    └── Acme.Orders.Integration.Tests/
-```
-
-### Pattern C — Microservices / Multi-Service Monorepo
-
-```
-AcmePlatform/
-├── AcmePlatform.sln
-├── Directory.Build.props
-├── Directory.Packages.props
-├── shared/
-│   ├── Acme.Shared.Contracts/        ← DTOs, events (shared via NuGet or project ref)
-│   └── Acme.Shared.Infrastructure/  ← common infra (auth, logging setup)
-├── services/
-│   ├── orders/
-│   │   ├── src/
-│   │   │   ├── Orders.Domain/
-│   │   │   ├── Orders.Application/
-│   │   │   ├── Orders.Infrastructure/
-│   │   │   └── Orders.Api/
-│   │   └── tests/
-│   ├── inventory/
-│   │   └── ...
-│   └── notifications/
-│       └── ...
-├── tools/
-│   └── Acme.Cli/                     ← internal tooling
-└── docker/
-    ├── docker-compose.yml
-    ├── orders.Dockerfile
-    └── inventory.Dockerfile
-```
-
-### Pattern D — MAUI + API (mobile app + backend)
-
-```
-AcmeApp/
-├── AcmeApp.sln
-├── Directory.Build.props
-├── src/
-│   ├── AcmeApp.Shared/               ← shared models, interfaces (netstandard2.1)
-│   ├── AcmeApp.Api/                  ← ASP.NET Core API (net9.0)
-│   ├── AcmeApp.Maui/                 ← MAUI shell (net9.0-android;net9.0-ios)
-│   └── AcmeApp.Core/                 ← business logic (net9.0)
-└── tests/
-    └── AcmeApp.Tests/
-```
-
----
-
-## 1.8 `global.json` — Pin the SDK Version
-
-Place `global.json` at the solution root to pin the exact SDK version for reproducible builds:
+Without this file, `dotnet` uses the most recent SDK installed on the
+machine. This creates "works on my machine" problems when teammates have
+different SDK versions. The fix is a `global.json` at the solution root:
 
 ```json
 {
   "sdk": {
-    "version": "9.0.100",
-    "rollForward": "latestPatch",
-    "allowPrerelease": false
+    "version": "9.0.101",
+    "rollForward": "latestPatch"
+    // rollForward options:
+    // "patch"        → only exact patch; fails if not installed
+    // "latestPatch"  → newest patch of same major.minor (recommended)
+    // "minor"        → also accepts newer minor versions
+    // "major"        → accepts any newer version
+    // "disable"      → fails if exact version not present
   }
 }
 ```
 
-| `rollForward` value | Behavior |
-|---------------------|----------|
-| `patch` | Use exact or latest patch |
-| `latestPatch` | Always use latest patch (recommended) |
-| `minor` | Roll forward to latest minor |
-| `latestMinor` | Roll to latest minor |
-| `major` | Roll forward across major versions |
-| `latestMajor` | Use whatever is installed |
-| `disable` | Exact version only — fail if missing |
+### `Directory.Build.props` — Properties Shared Across All Projects
 
----
-
-## 1.9 `.editorconfig` — Consistent Code Style
-
-```ini
-# .editorconfig (at solution root)
-root = true
-
-[*]
-indent_style = space
-indent_size = 4
-end_of_line = lf
-charset = utf-8
-trim_trailing_whitespace = true
-insert_final_newline = true
-
-[*.{cs,csx}]
-# Naming rules
-dotnet_naming_rule.private_fields_should_be_camel_case.symbols = private_fields
-dotnet_naming_rule.private_fields_should_be_camel_case.style = camel_case_style
-dotnet_naming_rule.private_fields_should_be_camel_case.severity = warning
-
-dotnet_naming_symbols.private_fields.applicable_kinds = field
-dotnet_naming_symbols.private_fields.applicable_accessibilities = private
-
-dotnet_naming_style.camel_case_style.capitalization = camel_case
-dotnet_naming_style.camel_case_style.required_prefix = _
-
-# Prefer var
-csharp_style_var_for_built_in_types = true:suggestion
-csharp_style_var_when_type_is_apparent = true:suggestion
-csharp_style_var_elsewhere = false:suggestion
-
-# Expression bodies
-csharp_style_expression_bodied_methods = when_on_single_line:suggestion
-csharp_style_expression_bodied_properties = true:suggestion
-
-# Pattern matching
-csharp_style_pattern_matching_over_is_with_cast_check = true:warning
-csharp_style_pattern_matching_over_as_with_null_check = true:warning
-
-# Null checks
-csharp_style_prefer_null_check_over_type_check = true:suggestion
-dotnet_style_null_propagation = true:suggestion
-dotnet_style_coalesce_expression = true:suggestion
-
-# Imports
-dotnet_sort_system_directives_first = true
-dotnet_separate_import_directive_groups = false
-
-[*.{json,yml,yaml}]
-indent_size = 2
-
-[*.md]
-trim_trailing_whitespace = false
-```
-
-> **Rider tip:** Rider reads `.editorconfig` automatically. Use *Code → Reformat Code* (`Ctrl+Alt+L` / `⌘⌥L`) to apply. *Settings → Editor → Code Style → C#* lets you export/import styles and sync with `.editorconfig`.
-
----
-
-## 1.10 NuGet Configuration
-
-### `nuget.config`
+MSBuild automatically imports `Directory.Build.props` from the solution
+root (or any parent directory) into every project. This lets you set
+`<Nullable>`, `<LangVersion>`, analysis configuration, and other
+shared settings exactly once rather than in every `.csproj`:
 
 ```xml
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <packageSources>
-    <clear />
-    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
-    <!-- Private feed (Azure Artifacts, GitHub Packages, etc.) -->
-    <add key="acme-feed" value="https://pkgs.dev.azure.com/acme/_packaging/acme/nuget/v3/index.json" />
-  </packageSources>
-  <packageSourceMapping>
-    <!-- Only allow specific packages from private feed -->
-    <packageSource key="acme-feed">
-      <package pattern="Acme.*" />
-    </packageSource>
-    <packageSource key="nuget.org">
-      <package pattern="*" />
-    </packageSource>
-  </packageSourceMapping>
-</configuration>
+<!-- Directory.Build.props — solution root -->
+<Project>
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <!-- In CI, all warnings become errors. Locally they are suggestions. -->
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+    <!-- Enable the full Roslyn analyzer suite -->
+    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
+    <!-- Enforce .editorconfig code style rules at build time -->
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+</Project>
+```
+
+### `Directory.Packages.props` — Central Package Version Management
+
+When a solution has many projects that share NuGet packages, version
+conflicts become a real maintenance problem. Central Package Management
+(CPM) puts every version in one file:
+
+```xml
+<!-- Directory.Packages.props — solution root -->
+<Project>
+  <PropertyGroup>
+    <!-- Enables CPM. PackageReferences in .csproj files must omit Version. -->
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Serilog"                           Version="3.1.1" />
+    <PackageVersion Include="Serilog.Sinks.Console"             Version="5.0.1" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore"     Version="9.0.0" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.0" />
+  </ItemGroup>
+</Project>
+```
+
+```xml
+<!-- Any .csproj in the solution -->
+<PackageReference Include="Serilog" />   <!-- no Version; it comes from the props file -->
 ```
 
 ---
 
-## 1.11 Runtimes & AOT Modes
+## 1.7 Solution Structure — Organising Your Projects
 
-### Execution Modes
+A solution (`.sln` file) is a container for related projects. The
+structure of your solution should make the dependency direction visible
+in the file system. Chapter 18 covers architectural patterns in depth;
+here is a practical starting point for any new project:
 
 ```
-Source (.cs)
-    │
-    ▼
-Roslyn compiler
-    │
-    ▼
-IL (intermediate language)
-    │
-    ├── JIT (default)
-    │     CoreCLR compiles IL → native at runtime
-    │     Tiered compilation: interpreted → Quick JIT → Optimized JIT
-    │
-    └── Native AOT
-          IL → native binary at publish time (no CLR needed)
-          Restrictions: no dynamic code gen, limited reflection
+MyApp/
+├── MyApp.sln
+├── global.json                    ← pins SDK version
+├── Directory.Build.props          ← shared properties for all projects
+├── Directory.Packages.props       ← central NuGet version management
+├── .editorconfig                  ← strict code style rules
+│
+├── src/
+│   ├── MyApp.Core/                ← domain logic, zero external dependencies
+│   │   └── MyApp.Core.csproj
+│   ├── MyApp.Infrastructure/      ← database, HTTP, file system
+│   │   └── MyApp.Infrastructure.csproj
+│   └── MyApp.Web/                 ← ASP.NET Core entry point, DI wiring
+│       └── MyApp.Web.csproj
+│
+└── tests/
+    ├── MyApp.Core.Tests/          ← pure unit tests, no infrastructure
+    └── MyApp.Integration.Tests/   ← real database, real HTTP
 ```
 
-### Tiered Compilation
+```bash
+# Bootstrap the entire structure
+dotnet new sln -n MyApp
+dotnet new classlib -n MyApp.Core          -o src/MyApp.Core
+dotnet new classlib -n MyApp.Infrastructure -o src/MyApp.Infrastructure
+dotnet new webapi   -n MyApp.Web           -o src/MyApp.Web
+dotnet new xunit    -n MyApp.Core.Tests    -o tests/MyApp.Core.Tests
 
-```csharp
-// Hot path gets Optimized JIT automatically after enough calls.
-// You can hint with RuntimeHelpers:
-using System.Runtime.CompilerServices;
+dotnet sln add src/**/*.csproj tests/**/*.csproj
 
-[MethodImpl(MethodImplOptions.AggressiveInlining)]
-private static int Add(int a, int b) => a + b;
-
-[MethodImpl(MethodImplOptions.AggressiveOptimization)]
-private void HotLoop()
-{
-    for (int i = 0; i < 10_000_000; i++) { /* ... */ }
-}
+# Wire up dependencies
+dotnet add src/MyApp.Infrastructure reference src/MyApp.Core
+dotnet add src/MyApp.Web            reference src/MyApp.Core
+dotnet add src/MyApp.Web            reference src/MyApp.Infrastructure
+dotnet add tests/MyApp.Core.Tests   reference src/MyApp.Core
 ```
+
+---
+
+## 1.8 The Three Execution Models: JIT, R2R, and Native AOT
+
+Understanding how your code executes matters not just for performance
+but for deployment decisions, container size, and startup time
+requirements. .NET offers three models with different trade-offs.
+
+### JIT — The Standard Model
+
+The default execution model. The C# compiler produces IL. The JIT
+compiler translates IL to native machine code the first time each method
+runs. The trade-off: the first few seconds of a process pay compilation
+overhead, but the JIT can produce highly optimised code tuned to the
+exact CPU it is running on — sometimes matching C++ performance on hot
+paths. .NET's JIT has grown extremely capable and includes PGO (Profile-
+Guided Optimisation) that recompiles hot methods with observed runtime
+data.
 
 ### ReadyToRun (R2R)
 
-Ahead-of-time JIT-compiled IL bundled into the assembly. Faster startup, slightly larger binary.
+A hybrid: the SDK pre-compiles IL to native code during publish, reducing
+startup time. The JIT still runs for methods not covered. This is the
+default for production ASP.NET Core publishes and gives you faster cold
+starts with no code changes.
 
-```xml
-<PublishReadyToRun>true</PublishReadyToRun>
+```bash
+dotnet publish -c Release -r linux-x64 /p:PublishReadyToRun=true
+```
+
+### Native AOT — Ahead-of-Time Compilation
+
+No JIT. No IL. No CLR startup overhead. The .NET toolchain compiles your
+code directly to a native binary at publish time, similar to how Go or
+Rust work. The result: single-file binaries, millisecond cold starts,
+and tiny container images (often under 10 MB).
+
+The trade-off: anything that relies on runtime code generation requires
+explicit support. The most common friction points are serialisation
+libraries that use reflection, and dynamic assembly loading. Chapter 21
+covers what to do about each of these.
+
+```bash
+dotnet publish -c Release -r linux-x64 /p:PublishAot=true
 ```
 
 ---
 
-## 1.12 IDE Setup
+## 1.9 The Big Picture: What Every Chapter Builds On
 
-### Rider (JetBrains) — Recommended
+This chapter established the map. Every concept in this book sits in one
+of the three layers described in §1.1.
 
-- Open solution: `File → Open → select .sln`
-- SDK detection: automatic from `global.json` or PATH
-- NuGet restore: automatic on open
-- **Essential first steps:**
-  - *Settings → Editor → Code Style → C#*: import `.editorconfig`
-  - *Settings → Tools → External Tools*: add `dotnet watch`
-  - *Settings → Plugins*: install *GitToolBox*, *IdeaVim* (optional)
+The chapters that follow progress through those layers from the bottom up:
 
-### Visual Studio 2022
+- **Ch 2–5** teach the language as enforced by the C# compiler and the
+  runtime type system. Nullable reference types (Ch 2), pattern matching
+  (Ch 3), delegates (Ch 4), and interfaces (Ch 5) are all compiler and
+  runtime features.
 
-- Install workloads: `.NET desktop development`, `ASP.NET and web development`, `Mobile development with .NET`
-- Extensions: *ReSharper* (JetBrains), *GitHub Copilot*, *OzCode* (debugging)
-- **Essential settings:**
-  - *Tools → Options → Text Editor → C# → Advanced*: enable *Enable full solution analysis*
-  - *Tools → Options → Projects and Solutions → Build and Run*: set *On Run, when projects are out of date* to *Always build*
+- **Ch 6** teaches design principles. Language-agnostic in spirit, but
+  expressed through the types and constraints you learned in Ch 2–5.
 
-### VS Code
+- **Ch 7–8** complete the language with BCL-level collections and the
+  BCL's async/Task infrastructure.
 
-```bash
-code --install-extension ms-dotnettools.csdevkit     # C# DevKit (official)
-code --install-extension ms-dotnettools.csharp       # C# language support
-code --install-extension ms-dotnettools.vscode-dotnet-runtime
-```
+- **Ch 9–14** cover the application layer: how configuration flows in,
+  how DI wires components together, how ASP.NET Core handles HTTP.
 
-`.vscode/launch.json`:
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": ".NET Core Launch (console)",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "${workspaceFolder}/bin/Debug/net9.0/MyApp.dll",
-      "args": [],
-      "cwd": "${workspaceFolder}",
-      "console": "internalConsole",
-      "stopAtEntry": false
-    }
-  ]
-}
-```
+- **Ch 15a and Ch 15** cover data: raw SQL (the language below every ORM)
+  and EF Core (the ORM that generates it).
 
+- **Ch 16–17** cover hosting and testing — the practices that make
+  everything else reliable in production.
 
-> **Rider tip:** Use *File → New Solution* for full project scaffolding with templates. The *NuGet* tool window (`Tools → NuGet → Manage NuGet Packages`) manages packages with version comparison. `global.json` and `Directory.Build.props` are auto-detected and respected.
+- **Ch 18** zooms out and discusses how to arrange all the pieces. By
+  that point you will have seen every piece individually.
 
-> **VS tip:** *File → New → Project* opens the template picker. *Tools → NuGet Package Manager → Manage NuGet Packages for Solution* manages packages across all projects at once. Set *Tools → Options → Projects → SDK-style projects → Default SDK* to control which .NET version new projects target.
+- **Ch 19–32** are deep dives: UI, performance, security, patterns,
+  observability.
+
+- **Ch 33–40** are complete projects that exercise everything at once.
+
+At every point, when you encounter a concept, its position in the stack
+tells you what it depends on and what depends on it. That is the whole
+purpose of this chapter.

@@ -1,726 +1,457 @@
-# Chapter 15 — Entity Framework Core
+# Chapter 15 — Entity Framework Core & Data Access
 
-## 15.1 Project Setup
+> A relational database stores data as tables of rows. Your C# code works
+> with objects and graphs. Bridging the two worlds — without writing SQL
+> for every operation, without loading entire tables into memory, and
+> without introducing security holes — is the job of an ORM. EF Core is
+> .NET's built-in ORM. This chapter explains how it maps objects to SQL,
+> how to use it correctly, and when to bypass it.
 
-```xml
-<!-- MyApp.Infrastructure.csproj -->
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <!-- Core -->
-    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
-    <!-- Providers -->
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.0" />
-    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.0" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="9.0.0" />
-    <!-- Tooling (design-time) -->
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.0" PrivateAssets="all" />
-    <!-- For migration generation from separate project -->
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="9.0.0" PrivateAssets="all" />
-  </ItemGroup>
-</Project>
+*Building on:* Ch 2 (classes, records, nullable), Ch 5 (OOP — entity
+classes), Ch 8 (async — all DB calls should be async), Ch 9 (configuration
+— connection strings), Ch 10 (DI — DbContext lifetime), Ch 15a (SQL — read
+that chapter first; EF Core generates SQL and you must be able to read it)
+
+---
+
+## 15.1 The ORM Mental Model — What EF Core Is and Is Not
+
+EF Core is not a magic layer that makes SQL invisible. It is a tool that
+translates LINQ expression trees (Ch 4 §4.7) into SQL, tracks which
+objects you have changed (change tracking), and maps result rows back to
+objects. The generated SQL is real SQL — you can log it, read it, and
+optimise it.
+
+Understanding this prevents the most common EF Core bugs:
+- Queries that load entire tables into memory (because you broke out of
+  `IQueryable` too early — see §15.12)
+- N+1 queries (because you accessed a navigation property in a loop)
+- Missing indexes (because you wrote a LINQ query that EF translated to
+  a full table scan)
+- Slow inserts (because you called `SaveChanges` inside a loop)
+
+The relationship between your code and the database:
+
+```
+Your C# code
+    ↓ LINQ expression trees
+EF Core (query translator)
+    ↓ SQL string
+ADO.NET (SqlConnection / NpgsqlConnection / SqliteConnection)
+    ↓ TCP/socket
+Database engine (SQLite / PostgreSQL / SQL Server)
 ```
 
 ---
 
-## 15.2 Defining the Domain
+## 15.2 Setup — Packages and Connection
 
-```csharp
-// Domain/Entities/User.cs
-public class User
-{
-    public int Id { get; set; }
-    public required string Email { get; set; }
-    public required string Name { get; set; }
-    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    public bool IsActive { get; set; } = true;
+```bash
+# SQLite (file-based, great for development and small apps)
+dotnet add package Microsoft.EntityFrameworkCore.Sqlite
+dotnet add package Microsoft.EntityFrameworkCore.Design   # for migrations CLI
 
-    // Navigation properties
-    public ICollection<Order> Orders { get; set; } = new List<Order>();
-    public UserProfile? Profile { get; set; }
-}
+# PostgreSQL
+dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL
 
-// Domain/Entities/Order.cs
-public class Order
-{
-    public int Id { get; set; }
-    public int UserId { get; set; }
-    public string Status { get; set; } = "Pending";
-    public DateTime PlacedAt { get; set; } = DateTime.UtcNow;
-    public decimal Total { get; set; }
+# SQL Server
+dotnet add package Microsoft.EntityFrameworkCore.SqlServer
 
-    // Navigation
-    public User User { get; set; } = null!;
-    public ICollection<OrderLine> Lines { get; set; } = new List<OrderLine>();
-}
-
-public class OrderLine
-{
-    public int Id { get; set; }
-    public int OrderId { get; set; }
-    public string Sku { get; set; } = "";
-    public int Quantity { get; set; }
-    public decimal UnitPrice { get; set; }
-    public decimal LineTotal => Quantity * UnitPrice;
-
-    public Order Order { get; set; } = null!;
-}
-
-public class UserProfile
-{
-    public int UserId { get; set; }  // PK + FK (one-to-one)
-    public string? AvatarUrl { get; set; }
-    public string? Bio { get; set; }
-    public User User { get; set; } = null!;
-}
+# Install the EF Core CLI tool
+dotnet tool install --global dotnet-ef
 ```
 
 ---
 
-## 15.3 DbContext
+## 15.3 Defining the Domain — Entity Classes
+
+Entity classes are plain C# classes. EF Core requires no base class,
+no attributes on most properties. By convention, a property named `Id`
+or `{TypeName}Id` becomes the primary key.
 
 ```csharp
-// Infrastructure/Persistence/AppDbContext.cs
+// A minimal but complete domain for a task tracker
+public class Project
+{
+    public int    Id          { get; set; }
+    public string Name        { get; set; } = "";
+    public string? Description { get; set; }
+    public DateTime CreatedAt { get; set; }
+
+    // Navigation property: EF Core will fill this when you .Include(p => p.Tasks)
+    public List<TaskItem> Tasks { get; set; } = [];
+}
+
+public class TaskItem
+{
+    public int    Id          { get; set; }
+    public string Title       { get; set; } = "";
+    public TaskStatus Status  { get; set; }
+    public DateTime? DueDate  { get; set; }
+
+    // Foreign key — EF Core maps this to a NOT NULL FK column
+    public int     ProjectId  { get; set; }
+    // Navigation property — the related Project object
+    public Project Project    { get; set; } = null!;   // null! = EF will populate this
+}
+
+public enum TaskStatus { Todo, InProgress, Done, Cancelled }
+```
+
+---
+
+## 15.4 `DbContext` — The Unit of Work
+
+`DbContext` is EF Core's central class. It represents a session with the
+database and contains `DbSet<T>` properties for each entity type you want
+to query and manipulate. It does three jobs simultaneously:
+
+1. **Query**: translates LINQ to SQL and materialises results
+2. **Change tracking**: remembers which entities you loaded and what changed
+3. **Unit of Work**: accumulates changes and commits them all at once via `SaveChangesAsync`
+
+```csharp
 public class AppDbContext : DbContext
 {
+    public DbSet<Project>  Projects { get; set; } = null!;
+    public DbSet<TaskItem> Tasks    { get; set; } = null!;
+
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
-    public DbSet<User>       Users      => Set<User>();
-    public DbSet<Order>      Orders     => Set<Order>();
-    public DbSet<OrderLine>  OrderLines => Set<OrderLine>();
-    public DbSet<UserProfile> Profiles  => Set<UserProfile>();
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    protected override void OnModelCreating(ModelBuilder builder)
     {
-        // Apply all IEntityTypeConfiguration<T> classes in this assembly
-        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
-
-        // Or individually:
-        // modelBuilder.ApplyConfiguration(new UserConfiguration());
-
-        // Global query filter (e.g. soft delete)
-        modelBuilder.Entity<User>().HasQueryFilter(u => u.IsActive);
-    }
-
-    // Intercept saves for audit fields
-    public override async Task<int> SaveChangesAsync(CancellationToken ct = default)
-    {
-        foreach (var entry in ChangeTracker.Entries())
+        // Fluent API: fine-grained schema control beyond conventions
+        builder.Entity<Project>(e =>
         {
-            if (entry.Entity is IAuditableEntity auditable)
-            {
-                if (entry.State == EntityState.Added)
-                    auditable.CreatedAt = DateTime.UtcNow;
-                if (entry.State is EntityState.Added or EntityState.Modified)
-                    auditable.UpdatedAt = DateTime.UtcNow;
-            }
-        }
-        return await base.SaveChangesAsync(ct);
-    }
-}
-```
+            e.HasKey(p => p.Id);
+            e.Property(p => p.Name).HasMaxLength(200).IsRequired();
+            e.Property(p => p.CreatedAt).HasDefaultValueSql("CURRENT_TIMESTAMP");
+            e.HasIndex(p => p.Name).IsUnique();
+        });
 
----
-
-## 15.4 Fluent API Configuration
-
-Use `IEntityTypeConfiguration<T>` to keep configuration out of `OnModelCreating`:
-
-```csharp
-// Infrastructure/Persistence/Configurations/UserConfiguration.cs
-public class UserConfiguration : IEntityTypeConfiguration<User>
-{
-    public void Configure(EntityTypeBuilder<User> b)
-    {
-        b.ToTable("users");
-
-        b.HasKey(u => u.Id);
-
-        b.Property(u => u.Email)
-            .IsRequired()
-            .HasMaxLength(256)
-            .IsUnicode(false);  // ASCII for emails — smaller index
-
-        b.HasIndex(u => u.Email).IsUnique();
-
-        b.Property(u => u.Name)
-            .IsRequired()
-            .HasMaxLength(100);
-
-        b.Property(u => u.CreatedAt)
-            .HasDefaultValueSql("CURRENT_TIMESTAMP");  // SQLite/PostgreSQL
-
-        // One-to-one: User → UserProfile
-        b.HasOne(u => u.Profile)
-            .WithOne(p => p.User)
-            .HasForeignKey<UserProfile>(p => p.UserId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        // One-to-many: User → Orders
-        b.HasMany(u => u.Orders)
-            .WithOne(o => o.User)
-            .HasForeignKey(o => o.UserId)
-            .OnDelete(DeleteBehavior.Restrict); // don't cascade delete orders
-
-        // Owned entity (value object embedded in same table)
-        // b.OwnsOne(u => u.Address, a => {
-        //     a.Property(x => x.City).HasColumnName("city");
-        //     a.Property(x => x.Country).HasColumnName("country");
-        // });
-
-        // Seed data
-        b.HasData(new User
+        builder.Entity<TaskItem>(e =>
         {
-            Id = 1,
-            Email = "admin@example.com",
-            Name = "Admin",
-            IsActive = true,
-            CreatedAt = new DateTime(2024, 1, 1)
+            e.HasKey(t => t.Id);
+            e.Property(t => t.Title).HasMaxLength(500).IsRequired();
+            e.Property(t => t.Status)
+             .HasConversion<string>()          // store enum as string, not int
+             .HasDefaultValue(TaskStatus.Todo);
+
+            // Relationship: many tasks belong to one project
+            e.HasOne(t => t.Project)
+             .WithMany(p => p.Tasks)
+             .HasForeignKey(t => t.ProjectId)
+             .OnDelete(DeleteBehavior.Cascade);
         });
     }
 }
+```
 
-// OrderConfiguration.cs
-public class OrderConfiguration : IEntityTypeConfiguration<Order>
+---
+
+## 15.5 Registering `DbContext` with Dependency Injection
+
+`DbContext` is a Scoped service — one instance per HTTP request (or per
+unit of work in non-HTTP code). This is intentional: change tracking is
+per-instance and DbContext is not thread-safe. Never share a DbContext
+across threads.
+
+```csharp
+// ASP.NET Core or Generic Host
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlite(builder.Configuration["Database:ConnectionString"])
+           .EnableSensitiveDataLogging(builder.Environment.IsDevelopment())
+           .EnableDetailedErrors(builder.Environment.IsDevelopment())
+           .LogTo(Console.WriteLine, LogLevel.Information));
+
+// Inject into a service or endpoint
+public class ProjectService(AppDbContext db)
 {
-    public void Configure(EntityTypeBuilder<Order> b)
-    {
-        b.ToTable("orders");
-
-        b.Property(o => o.Status)
-            .HasMaxLength(50)
-            .HasDefaultValue("Pending");
-
-        b.Property(o => o.Total)
-            .HasColumnType("decimal(18,2)");
-
-        b.HasMany(o => o.Lines)
-            .WithOne(l => l.Order)
-            .HasForeignKey(l => l.OrderId)
-            .OnDelete(DeleteBehavior.Cascade);
-    }
+    // db is a Scoped instance, alive for one request
 }
 ```
 
 ---
 
-## 15.5 Registration and Connection
+## 15.6 Querying — LINQ Over `DbSet<T>`
+
+Every query starts from a `DbSet<T>` which is an `IQueryable<T>`. LINQ
+operators chain on it. Nothing is executed until you call a terminal
+operator (`ToListAsync`, `FirstOrDefaultAsync`, etc.).
 
 ```csharp
-// SQLite
-services.AddDbContext<AppDbContext>(opt =>
-    opt.UseSqlite(
-        configuration.GetConnectionString("Default") ?? "Data Source=app.db",
-        sqlite =>
-        {
-            sqlite.MigrationsAssembly("MyApp.Infrastructure");
-            sqlite.CommandTimeout(30);
-        })
-       .EnableSensitiveDataLogging(env.IsDevelopment())
-       .EnableDetailedErrors(env.IsDevelopment())
-       .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTrackingWithIdentityResolution)
-);
+// Get all active projects
+var projects = await db.Projects
+    .Where(p => p.Tasks.Any(t => t.Status != TaskStatus.Done))
+    .OrderBy(p => p.Name)
+    .ToListAsync(ct);
+// SQL: SELECT * FROM Projects p WHERE EXISTS (SELECT 1 FROM Tasks t WHERE t.ProjectId = p.Id AND t.Status != 'Done') ORDER BY p.Name
 
-// SQLite pragmas for performance
-services.AddDbContext<AppDbContext>((sp, opt) =>
-{
-    opt.UseSqlite("Data Source=app.db");
-    opt.AddInterceptors(sp.GetRequiredService<SqlitePragmaInterceptor>());
-});
+// Load a project with its tasks (eager loading via Include)
+var project = await db.Projects
+    .Include(p => p.Tasks.Where(t => t.Status != TaskStatus.Cancelled))
+    .FirstOrDefaultAsync(p => p.Id == id, ct);
+// SQL: SELECT p.*, t.* FROM Projects p LEFT JOIN Tasks t ON t.ProjectId = p.Id WHERE p.Id = @id
 
-// SqlitePragmaInterceptor
-public class SqlitePragmaInterceptor : DbConnectionInterceptor
+// Projection: select only the columns you need
+var summaries = await db.Projects
+    .Select(p => new ProjectSummary(
+        p.Id, p.Name,
+        p.Tasks.Count(t => t.Status == TaskStatus.Done),
+        p.Tasks.Count(t => t.Status != TaskStatus.Done)))
+    .ToListAsync(ct);
+// SQL: SELECT p.Id, p.Name, COUNT(done tasks), COUNT(pending tasks) FROM...
+// Only those columns are returned — much more efficient than loading full entities
+```
+
+### N+1 — The Most Common Performance Bug
+
+```csharp
+// BUG: N+1 queries — 1 query for projects + 1 per project for tasks
+var projects = await db.Projects.ToListAsync(ct);
+foreach (var project in projects)
 {
-    public override async Task ConnectionOpenedAsync(
-        DbConnection connection, ConnectionEndEventData eventData, CancellationToken ct)
-    {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA cache_size = -64000;   -- 64MB cache
-            PRAGMA foreign_keys = ON;
-            PRAGMA temp_store = MEMORY;
-            """;
-        await cmd.ExecuteNonQueryAsync(ct);
-    }
+    // EF Core lazily loads Tasks for each project — one SQL query per project!
+    Console.WriteLine($"{project.Name}: {project.Tasks.Count} tasks");
 }
 
-// PostgreSQL
-services.AddDbContext<AppDbContext>(opt =>
-    opt.UseNpgsql(
-        configuration.GetConnectionString("Default"),
-        npg => npg.MigrationsAssembly("MyApp.Infrastructure")));
+// FIX: eager loading with Include
+var projects2 = await db.Projects
+    .Include(p => p.Tasks)
+    .ToListAsync(ct);
+// One query with a JOIN — all data in one round trip
 ```
+
+Never enable lazy loading in production code (the `virtual` navigation
+property pattern). It makes N+1 the default behaviour, hiding the
+performance problem until production load exposes it.
 
 ---
 
-## 15.6 Querying
-
-### Basic LINQ Queries
+## 15.7 CRUD — Creating, Updating, Deleting
 
 ```csharp
-// Inject via constructor
-public class UserRepository : IUserRepository
-{
-    private readonly AppDbContext _db;
-    public UserRepository(AppDbContext db) => _db = db;
+// CREATE
+var project = new Project { Name = "Website Redesign", CreatedAt = DateTime.UtcNow };
+db.Projects.Add(project);
+await db.SaveChangesAsync(ct);
+// project.Id is now populated by the database
 
-    // Find by PK (uses key lookup)
-    public async Task<User?> GetByIdAsync(int id, CancellationToken ct)
-        => await _db.Users.FindAsync([id], ct);
+// UPDATE — load, modify, save
+var task = await db.Tasks.FindAsync([taskId], ct);
+if (task is null) throw new NotFoundException($"Task {taskId} not found");
+task.Status = TaskStatus.Done;
+await db.SaveChangesAsync(ct);  // EF detects the change and generates UPDATE
 
-    // Single with no tracking (read-only — faster)
-    public async Task<User?> GetByEmailAsync(string email, CancellationToken ct)
-        => await _db.Users
-            .AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Email == email, ct);
+// UPDATE without loading the entity (ExecuteUpdateAsync — EF Core 7+)
+await db.Tasks
+    .Where(t => t.ProjectId == projectId && t.Status == TaskStatus.Todo)
+    .ExecuteUpdateAsync(setters => setters
+        .SetProperty(t => t.Status, TaskStatus.Cancelled), ct);
+// One SQL UPDATE statement — no entity loading, no change tracking
 
-    // Include navigation properties (eager loading)
-    public async Task<User?> GetWithOrdersAsync(int id, CancellationToken ct)
-        => await _db.Users
-            .Include(u => u.Orders)
-                .ThenInclude(o => o.Lines)
-            .Include(u => u.Profile)
-            .FirstOrDefaultAsync(u => u.Id == id, ct);
+// DELETE — load then remove
+db.Tasks.Remove(task);
+await db.SaveChangesAsync(ct);
 
-    // Projection — only load what you need (avoids over-fetching)
-    public async Task<UserSummaryDto[]> GetSummariesAsync(CancellationToken ct)
-        => await _db.Users
-            .AsNoTracking()
-            .Where(u => u.IsActive)
-            .Select(u => new UserSummaryDto(
-                u.Id,
-                u.Name,
-                u.Email,
-                u.Orders.Count))
-            .OrderBy(u => u.Name)
-            .ToArrayAsync(ct);
-
-    // Pagination
-    public async Task<PagedResult<User>> GetPagedAsync(
-        int page, int pageSize, CancellationToken ct)
-    {
-        var query = _db.Users.AsNoTracking().OrderBy(u => u.Name);
-        var total = await query.CountAsync(ct);
-        var items = await query
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .ToListAsync(ct);
-        return new PagedResult<User>(items, total, page, pageSize);
-    }
-}
-```
-
-### Raw SQL and FromSqlRaw
-
-```csharp
-// Parameterized raw SQL (safe from injection)
-var users = await _db.Users
-    .FromSqlRaw("SELECT * FROM users WHERE email = {0}", email)
-    .AsNoTracking()
-    .ToListAsync(ct);
-
-// FormattableString (interpolation — also parameterized, C# 8+)
-var users2 = await _db.Users
-    .FromSql($"SELECT * FROM users WHERE email = {email}")
-    .ToListAsync(ct);
-
-// Execute non-query SQL
-await _db.Database.ExecuteSqlRawAsync(
-    "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = {0}", id);
-
-// Mixed LINQ + raw
-var orders = await _db.Orders
-    .FromSqlRaw("SELECT * FROM orders WHERE status = 'Pending'")
-    .Include(o => o.Lines)
-    .Where(o => o.Total > 100)
-    .ToListAsync(ct);
-```
-
-### Bulk Operations (EF Core 7+)
-
-```csharp
-// ExecuteUpdateAsync / ExecuteDeleteAsync — bypass change tracker, direct SQL
-int updated = await _db.Users
-    .Where(u => !u.IsActive && u.CreatedAt < DateTime.UtcNow.AddYears(-1))
-    .ExecuteDeleteAsync(ct);  // DELETE FROM users WHERE ...
-
-int activated = await _db.Users
-    .Where(u => u.Orders.Any(o => o.PlacedAt > DateTime.UtcNow.AddDays(-7)))
-    .ExecuteUpdateAsync(s => s
-        .SetProperty(u => u.IsActive, true)
-        .SetProperty(u => u.Name, u => u.Name + " (active)"),
-        ct);
-```
-
-### Compiled Queries — Eliminate LINQ Translation Overhead
-
-```csharp
-// Define once as static — translation happens at startup, not per call
-private static readonly Func<AppDbContext, string, Task<User?>> _getUserByEmail =
-    EF.CompileAsyncQuery((AppDbContext db, string email) =>
-        db.Users.AsNoTracking().FirstOrDefault(u => u.Email == email));
-
-private static readonly Func<AppDbContext, int, IAsyncEnumerable<Order>> _getUserOrders =
-    EF.CompileAsyncQuery((AppDbContext db, int userId) =>
-        db.Orders.Where(o => o.UserId == userId).OrderByDescending(o => o.PlacedAt));
-
-// Usage
-var user = await _getUserByEmail(_db, "alice@example.com");
-await foreach (var order in _getUserOrders(_db, userId)) { ... }
-```
-
----
-
-## 15.7 CRUD Operations
-
-```csharp
-// Create
-var user = new User { Email = "alice@example.com", Name = "Alice" };
-_db.Users.Add(user);
-await _db.SaveChangesAsync(ct);
-// user.Id is now set
-
-// AddRange
-var users = new[] { user1, user2, user3 };
-await _db.Users.AddRangeAsync(users, ct);
-await _db.SaveChangesAsync(ct);
-
-// Update (tracked entity)
-var existing = await _db.Users.FindAsync([id], ct);
-if (existing is not null)
-{
-    existing.Name = "New Name";
-    existing.Email = "new@example.com";
-    await _db.SaveChangesAsync(ct); // only changed properties are updated
-}
-
-// Update disconnected entity
-_db.Users.Update(user); // marks ALL properties as modified
-await _db.SaveChangesAsync(ct);
-
-// Attach and set modified (selective)
-_db.Users.Attach(user);
-_db.Entry(user).Property(u => u.Name).IsModified = true;
-await _db.SaveChangesAsync(ct);
-
-// Delete
-var toDelete = await _db.Users.FindAsync([id], ct);
-if (toDelete is not null)
-{
-    _db.Users.Remove(toDelete);
-    await _db.SaveChangesAsync(ct);
-}
-
-// Delete by ID (no extra query)
-_db.Users.Remove(new User { Id = id }); // create stub with just PK
-await _db.SaveChangesAsync(ct);
+// DELETE without loading (ExecuteDeleteAsync — EF Core 7+)
+int deleted = await db.Tasks
+    .Where(t => t.DueDate < DateTime.UtcNow && t.Status == TaskStatus.Done)
+    .ExecuteDeleteAsync(ct);
 ```
 
 ---
 
 ## 15.8 Transactions
 
-```csharp
-// Implicit transaction (default — single SaveChanges is atomic)
-_db.Users.Add(user);
-_db.Orders.Add(order);
-await _db.SaveChangesAsync(ct); // both saved atomically
+`SaveChangesAsync` is implicitly transactional — all changes in one call
+succeed or fail together. For operations that span multiple `SaveChanges`
+calls, use explicit transactions:
 
-// Explicit transaction
-await using var tx = await _db.Database.BeginTransactionAsync(ct);
+```csharp
+await using var transaction = await db.Database.BeginTransactionAsync(ct);
 try
 {
-    _db.Users.Add(user);
-    await _db.SaveChangesAsync(ct);
+    project.Status = ProjectStatus.Archived;
+    await db.SaveChangesAsync(ct);
 
-    _db.Orders.Add(new Order { UserId = user.Id, Total = 99.99m });
-    await _db.SaveChangesAsync(ct);
+    await db.Tasks
+        .Where(t => t.ProjectId == project.Id && t.Status == TaskStatus.Todo)
+        .ExecuteUpdateAsync(s => s.SetProperty(t => t.Status, TaskStatus.Cancelled), ct);
 
-    await tx.CommitAsync(ct);
+    await transaction.CommitAsync(ct);
 }
 catch
 {
-    await tx.RollbackAsync(ct);
+    await transaction.RollbackAsync(ct);
     throw;
 }
-
-// Savepoints (EF Core 5+)
-await using var tx2 = await _db.Database.BeginTransactionAsync(ct);
-_db.Users.Add(user);
-await _db.SaveChangesAsync(ct);
-await tx2.CreateSavepointAsync("after_user", ct);
-
-try
-{
-    DoRiskyOperation();
-    await _db.SaveChangesAsync(ct);
-    await tx2.CommitAsync(ct);
-}
-catch
-{
-    await tx2.RollbackToSavepointAsync("after_user", ct);
-    // user is still saved, risky op is rolled back
-    await tx2.CommitAsync(ct);
-}
 ```
 
 ---
 
-## 15.9 Migrations
+## 15.9 Migrations — Managing Schema Evolution
+
+Migrations are C# classes that describe how to transform the database
+schema from one version to the next. They are the Git history of your
+schema — commit them alongside the code that requires them.
 
 ```bash
-# Install EF Core tools (once per machine)
-dotnet tool install --global dotnet-ef
+# Create a migration after changing entity classes
+dotnet ef migrations add AddTaskPriority
 
-# Add a migration
-dotnet ef migrations add InitialCreate \
-    --project src/MyApp.Infrastructure \
-    --startup-project src/MyApp.Api
+# Review the generated migration file before applying
+# It's in Migrations/YYYYMMDDHHMMSS_AddTaskPriority.cs
 
-# Add to specific folder
-dotnet ef migrations add AddUserProfile \
-    --project src/MyApp.Infrastructure \
-    --startup-project src/MyApp.Api \
-    --output-dir Persistence/Migrations
+# Apply all pending migrations
+dotnet ef database update
 
-# Apply migrations
-dotnet ef database update \
-    --project src/MyApp.Infrastructure \
-    --startup-project src/MyApp.Api
+# Generate a SQL script (review before running in production)
+dotnet ef migrations script --idempotent > migrate.sql
 
-# Apply to specific migration
-dotnet ef database update InitialCreate ...
-
-# Rollback
-dotnet ef database update PreviousMigration ...
-
-# List migrations
-dotnet ef migrations list ...
-
-# Remove last migration (before applying)
-dotnet ef migrations remove ...
-
-# Generate SQL script (for production deployments)
-dotnet ef migrations script \
-    --idempotent \
-    --project src/MyApp.Infrastructure \
-    --startup-project src/MyApp.Api \
-    --output deploy/migrate.sql
+# Roll back to a specific migration
+dotnet ef database update PreviousMigrationName
 ```
 
-### Apply Migrations at Startup
-
 ```csharp
-// In Program.cs or a hosted service
-if (app.Environment.IsDevelopment())
-{
-    using var scope = app.Services.CreateScope();
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.MigrateAsync(); // apply pending migrations
-}
-
-// Or use a migration service
-public class MigrationService : IHostedService
-{
-    private readonly IServiceScopeFactory _scopeFactory;
-    public MigrationService(IServiceScopeFactory f) => _scopeFactory = f;
-
-    public async Task StartAsync(CancellationToken ct)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        await db.Database.MigrateAsync(ct);
-    }
-
-    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
-}
+// Auto-apply migrations at startup (appropriate for development and small apps)
+// In production, prefer the SQL script approach with DBA review
+await using var scope = app.Services.CreateAsyncScope();
+await scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.MigrateAsync();
 ```
 
 ---
 
-## 15.10 Dapper — Micro-ORM for Complex Queries
+## 15.10 Dapper — Raw SQL When EF Cannot Express It
 
-```xml
-<PackageReference Include="Dapper" Version="2.1.35" />
+Dapper is a micro-ORM that maps SQL query results to C# objects. It is
+the right tool for complex analytical queries, stored procedures, or
+any case where you know exactly what SQL you want and EF Core's
+translation would be awkward or inefficient.
+
+```bash
+dotnet add package Dapper
 ```
 
 ```csharp
 using Dapper;
 using Microsoft.Data.Sqlite;
 
-// Use Dapper alongside EF Core for complex queries
-public class ReportRepository
-{
-    private readonly string _connectionString;
+// Simple query
+await using var conn = new SqliteConnection(connectionString);
 
-    public ReportRepository(IConfiguration config)
-        => _connectionString = config.GetConnectionString("Default")!;
+var projects = await conn.QueryAsync<ProjectSummary>("""
+    SELECT
+        p.Id,
+        p.Name,
+        COUNT(t.Id) FILTER (WHERE t.Status = 'Done')    AS CompletedTasks,
+        COUNT(t.Id) FILTER (WHERE t.Status != 'Done')   AS PendingTasks,
+        MAX(t.DueDate)                                   AS NextDue
+    FROM Projects p
+    LEFT JOIN Tasks t ON t.ProjectId = p.Id
+    GROUP BY p.Id, p.Name
+    ORDER BY NextDue
+    """);
 
-    public async Task<IEnumerable<OrderSummary>> GetOrderSummaryAsync(
-        DateTime from, DateTime to, CancellationToken ct)
-    {
-        const string sql = """
-            SELECT
-                u.name          AS UserName,
-                COUNT(o.id)     AS OrderCount,
-                SUM(o.total)    AS TotalSpent,
-                MAX(o.placed_at) AS LastOrder
-            FROM orders o
-            JOIN users u ON u.id = o.user_id
-            WHERE o.placed_at BETWEEN @From AND @To
-            GROUP BY u.id, u.name
-            ORDER BY TotalSpent DESC
-            """;
-
-        await using var conn = new SqliteConnection(_connectionString);
-        return await conn.QueryAsync<OrderSummary>(
-            sql,
-            new { From = from, To = to },
-            commandTimeout: 60);
-    }
-
-    public async Task<OrderDetail?> GetOrderDetailAsync(int orderId)
-    {
-        const string sql = """
-            SELECT o.*, l.sku, l.quantity, l.unit_price
-            FROM orders o
-            LEFT JOIN order_lines l ON l.order_id = o.id
-            WHERE o.id = @OrderId
-            """;
-
-        await using var conn = new SqliteConnection(_connectionString);
-        // Multi-mapping (join result)
-        var orderDict = new Dictionary<int, OrderDetail>();
-        await conn.QueryAsync<OrderDetail, OrderLineDetail, OrderDetail>(
-            sql,
-            (order, line) =>
-            {
-                if (!orderDict.TryGetValue(order.Id, out var o))
-                    orderDict[order.Id] = o = order;
-                if (line is not null) o.Lines.Add(line);
-                return o;
-            },
-            new { OrderId = orderId },
-            splitOn: "sku");
-
-        return orderDict.Values.FirstOrDefault();
-    }
-}
+// With parameters (never concatenate user input — always use parameters)
+var overdue = await conn.QueryAsync<TaskItem>(
+    "SELECT * FROM Tasks WHERE DueDate < @cutoff AND Status != @done",
+    new { cutoff = DateTime.UtcNow, done = "Done" });
 ```
+
+EF Core and Dapper coexist perfectly in the same application. Use EF
+for entity-level CRUD; use Dapper for complex reports and analytics.
 
 ---
 
-## 15.11 Change Tracking & Performance Tips
+## 15.11 Change Tracking and Performance
+
+EF Core tracks every entity it loads. When you call `SaveChangesAsync`,
+it compares current values with the snapshot taken at load time and
+generates the minimum SQL to sync the changes. This is powerful but has
+a cost.
 
 ```csharp
-// 1. AsNoTracking for read-only queries (no snapshot, no change tracking)
-var users = await _db.Users.AsNoTracking().ToListAsync();
+// AsNoTracking: disable change tracking for read-only queries
+// Faster: no snapshot, no comparison at save time
+var projects = await db.Projects
+    .AsNoTracking()           // no change tracking — purely reading
+    .Include(p => p.Tasks)
+    .ToListAsync(ct);
 
-// 2. AsNoTrackingWithIdentityResolution — dedup entities but no tracking
-var orders = await _db.Orders
+// AsNoTrackingWithIdentityResolution: no tracking but still deduplicates
+// entities if the same entity appears multiple times in the results
+var withShared = await db.Orders
     .AsNoTrackingWithIdentityResolution()
-    .Include(o => o.Lines)
-    .ToListAsync();
+    .Include(o => o.Customer)
+    .ToListAsync(ct);
 
-// 3. Select projections — never load more columns than needed
-var names = await _db.Users.Select(u => u.Name).ToListAsync();
-
-// 4. Split queries — for Include that causes cartesian explosion
-var users = await _db.Users
-    .Include(u => u.Orders)
-    .ThenInclude(o => o.Lines)
-    .AsSplitQuery()   // generates 3 separate queries instead of one JOIN
-    .ToListAsync();
-
-// 5. Lazy loading — install proxy package and enable (use carefully)
-services.AddDbContext<AppDbContext>(opt => opt
-    .UseSqlite(cs)
-    .UseLazyLoadingProxies()); // virtual navigation properties needed
-
-// 6. Batching with Chunk for large datasets
-await foreach (var chunk in _db.Users.AsNoTracking().AsChunkedAsync(100))
-{
-    await ProcessBatchAsync(chunk);
-}
-// Or:
-var i = 0;
-while (true)
-{
-    var batch = await _db.Users.Skip(i * 100).Take(100).ToListAsync();
-    if (batch.Count == 0) break;
-    await ProcessBatch(batch);
-    i++;
-}
-```
-
-> **Rider tip:** Rider's *Database* tool window (`View → Tool Windows → Database`) connects directly to SQLite, PostgreSQL, and SQL Server. You can run queries, browse the schema, and execute migration scripts without leaving the IDE.
-
-> **VS tip:** *View → SQL Server Object Explorer* for SQL Server. For SQLite, use the *SQLite/SQL Server Compact Toolbox* extension. The EF Core Power Tools extension adds a visual schema diagram and reverse-engineering tools.
-
-
----
-
-## 15.12 IEnumerable vs IQueryable — Critical Distinction
-
-This distinction directly affects whether your queries run in the database or in memory.
-
-```csharp
-// IEnumerable<T> — in-memory, evaluated locally
-IEnumerable<User> query = _db.Users.AsEnumerable()
-    .Where(u => u.Age > 18);
-// SQL: SELECT * FROM users    ← ALL rows loaded into memory FIRST
-// Then C# filters in memory. Returns 5 rows from 1 million.
-
-// IQueryable<T> — translated to SQL, evaluated at the database
-IQueryable<User> query = _db.Users
-    .Where(u => u.Age > 18);
-// SQL: SELECT * FROM users WHERE age > 18    ← database filters
-// Only the 5 matching rows are transferred. The rest never leave the DB.
-```
-
-### When Each Is Used
-
-```csharp
-// IQueryable: LINQ against DbSet — composed into SQL
-var adults = _db.Users.Where(u => u.Age > 18);           // IQueryable
-var named  = adults.Where(u => u.Name.StartsWith("A")); // still IQueryable
-// One SQL query: WHERE age > 18 AND name LIKE 'A%'
-
-// IEnumerable: anything after ToList/ToArray/AsEnumerable/foreach
-var list = _db.Users.ToList();              // IEnumerable — all rows in memory
-var filtered = list.Where(u => u.Age > 18); // in-memory LINQ
-
-// The classic mistake
-var report = _db.Orders
-    .AsEnumerable()                              // ← switches to in-memory!
-    .Where(o => ExpensiveLocalFunction(o))       // .NET function, can't translate
-    .ToList();
-// Loads ALL orders, then filters. Use AsEnumerable() only when:
-// - you need a .NET function that can't be translated to SQL
-// - you know the dataset is small
-
-// The right way when you need mixed filtering
-var preFiltered = _db.Orders
-    .Where(o => o.Status == OrderStatus.Active)  // SQL filter first
-    .AsEnumerable()                              // then in-memory for complex logic
-    .Where(o => ComplexLocalCheck(o))
-    .ToList();
-```
-
-### IQueryable Pitfalls
-
-```csharp
-// Deferred execution — query runs when enumerated, not when declared
-IQueryable<Order> query = _db.Orders.Where(o => o.Status == status);
-// Nothing happens yet
-
-status = OrderStatus.Cancelled; // change the captured variable
-var orders = query.ToList();    // query now uses "Cancelled", not original value!
-
-// Fix: force evaluation early if you need a snapshot
-var orders = _db.Orders.Where(o => o.Status == status).ToList(); // immediate
+// Bulk operations without tracking overhead
+await db.Tasks
+    .Where(t => t.Status == TaskStatus.Cancelled)
+    .ExecuteDeleteAsync(ct);   // one DELETE statement, no entity loading
 ```
 
 ---
 
+## 15.12 `IEnumerable<T>` vs `IQueryable<T>` — The Critical Distinction
+
+This is the most important EF Core concept to internalise. It determines
+whether your query runs in the database or in your process.
+
+`IQueryable<T>` is a query waiting to be executed. Every LINQ operator
+you apply adds to the expression tree — a description of what SQL to
+generate. Nothing touches the database until you materialise.
+
+`IEnumerable<T>` runs in .NET. Once you cross into `IEnumerable`, the
+data is already in memory and every subsequent operator runs in C#.
+
+```csharp
+// WRONG: loads EVERY row from the database, then filters in .NET
+var results = db.Tasks
+    .ToList()                           // ← materialises all rows into memory HERE
+    .Where(t => t.Status == TaskStatus.Done);  // filter runs in .NET
+
+// WRONG: AsEnumerable also materialises all rows
+var results2 = db.Tasks
+    .AsEnumerable()                     // ← switches to in-memory
+    .Where(t => t.Status == TaskStatus.Done);  // in .NET, not SQL
+
+// CORRECT: WHERE is part of the SQL
+var results3 = await db.Tasks
+    .Where(t => t.Status == TaskStatus.Done)   // added to SQL expression tree
+    .ToListAsync(ct);                           // NOW executes — one filtered SQL query
+
+// You can call non-translatable methods AFTER materialising,
+// but be aware that ALL rows matching the IQueryable conditions are loaded first:
+var formatted = await db.Tasks
+    .Where(t => t.Status == TaskStatus.Done)   // filter IN database
+    .ToListAsync(ct)                            // load filtered results
+    .ContinueWith(t => t.Result.Select(task => FormatTask(task)).ToList());
+// FormatTask is arbitrary C# — cannot be translated to SQL
+```
+
+The rule: **Stay `IQueryable` until you need to be `IEnumerable`.** Call
+`ToListAsync`, `FirstOrDefaultAsync`, `CountAsync`, or `AnyAsync` to
+materialise only when you are done filtering and projecting.
+
+---
+
+## 15.13 Connecting EF Core to the Rest of the Book
+
+- **Ch 15a (SQL)** — read it before this chapter. You should understand
+  what `JOIN`, `WHERE`, `GROUP BY` mean in SQL before trusting EF Core
+  to generate them.
+- **Ch 10 (DI)** — `DbContext` is registered as Scoped. The captive
+  dependency bug (Singleton holding Scoped DbContext) is a real risk.
+- **Ch 11 (DI Deep Dive)** — `IServiceScopeFactory` is how BackgroundService
+  gets a fresh DbContext per work cycle.
+- **Ch 17 (Testing)** — Testcontainers gives you a real database for
+  integration tests. In-memory providers are inadequate — they don't
+  enforce constraints or run real SQL.
+- **Ch 18 (Architectures)** — the Repository pattern (Ch 32) wraps
+  DbContext behind an interface. Clean Architecture puts DbContext in
+  the Infrastructure layer, away from domain logic.
+- **Ch 40 (Pet Projects — Databases)** — three complete projects
+  demonstrating code-first migrations, bulk operations, and multi-tenant
+  schema patterns.

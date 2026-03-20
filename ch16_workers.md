@@ -1,431 +1,346 @@
 # Chapter 16 — Worker Services & Background Jobs
 
-## 16.1 Worker Service Project
+> Not all work in a program responds to a request. Sending emails,
+> processing queued jobs, watching files, syncing data, cleaning up old
+> records — all of this happens in the background, driven by time or
+> events rather than user input. .NET's Generic Host and
+> `BackgroundService` provide a principled way to run this work as
+> long-running processes with the same configuration, DI, and logging
+> infrastructure as your web application.
+
+*Building on:* Ch 8 (async/await, CancellationToken — the entire
+lifecycle of a BackgroundService is async and cancellable), Ch 9
+(configuration), Ch 10 (DI — the host is a DI container),
+Ch 11 §11.8 (scoped services in BackgroundService — the captive
+dependency trap)
+
+---
+
+## 16.1 The Generic Host — The Engine Behind Workers and Web Apps
+
+The Generic Host is the chassis that every modern .NET application runs
+on, whether it is a web API, a background worker, or a CLI tool. It
+provides:
+
+- **Dependency Injection** — registers and resolves services
+- **Configuration** — loads `appsettings.json`, env vars, etc.
+- **Logging** — wires up ILogger for all services
+- **Lifetime management** — handles startup, graceful shutdown, and SIGTERM
+
+For web applications, ASP.NET Core is an `IHostedService` that plugs into
+the host. For background workers, your services are `IHostedService`
+(or its convenience subclass `BackgroundService`). The host starts all
+hosted services, waits for a shutdown signal, then stops them gracefully.
+
+```csharp
+// The entire skeleton of a worker service
+var host = Host.CreateDefaultBuilder(args)
+    .ConfigureServices((ctx, services) =>
+    {
+        // Configuration is already wired; add your services here
+        services.AddOptions<WorkerOptions>()
+            .BindConfiguration("Worker")
+            .ValidateOnStart();
+
+        services.AddDbContext<AppDbContext>(o =>
+            o.UseSqlite(ctx.Configuration["Database:ConnectionString"]));
+
+        // Register one or more background services
+        services.AddHostedService<CleanupWorker>();
+        services.AddHostedService<EmailWorker>();
+    })
+    .Build();
+
+await host.RunAsync();
+```
+
+`Host.CreateDefaultBuilder` wires the full configuration stack, Serilog-
+compatible logging, and SIGTERM handling for free.
+
+---
+
+## 16.2 `BackgroundService` — The Building Block
+
+`BackgroundService` is an abstract class that wraps `IHostedService`. You
+override one method: `ExecuteAsync`. The host calls it at startup and
+awaits it. When the host receives a shutdown signal, it cancels the
+`CancellationToken` that `ExecuteAsync` receives. Your service detects
+the cancellation and exits cleanly.
+
+```csharp
+// The pattern: a loop that does work, checks for cancellation, sleeps
+public class EmailDispatchWorker : BackgroundService
+{
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<EmailDispatchWorker> _logger;
+
+    public EmailDispatchWorker(IServiceScopeFactory scopeFactory,
+                               ILogger<EmailDispatchWorker> logger)
+    {
+        _scopeFactory = scopeFactory;
+        _logger       = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("Email dispatch worker starting");
+
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+
+        // WaitForNextTickAsync returns false when ct is cancelled
+        while (await timer.WaitForNextTickAsync(ct))
+        {
+            try
+            {
+                await DispatchPendingEmailsAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation — exit the loop cleanly
+                break;
+            }
+            catch (Exception ex)
+            {
+                // Log the error but keep the worker running
+                // A crash here stops the worker permanently — prefer resilience
+                _logger.LogError(ex, "Error dispatching emails");
+            }
+        }
+
+        _logger.LogInformation("Email dispatch worker stopped");
+    }
+
+    private async Task DispatchPendingEmailsAsync(CancellationToken ct)
+    {
+        // Create a new scope per cycle — DbContext is Scoped, not Singleton
+        await using var scope  = _scopeFactory.CreateAsyncScope();
+        var db    = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var email = scope.ServiceProvider.GetRequiredService<IEmailSender>();
+
+        var pending = await db.EmailQueue
+            .Where(e => e.Status == EmailStatus.Pending)
+            .Take(50)
+            .ToListAsync(ct);
+
+        foreach (var item in pending)
+        {
+            await email.SendAsync(item.To, item.Subject, item.Body, ct);
+            item.Status = EmailStatus.Sent;
+            item.SentAt = DateTime.UtcNow;
+        }
+        await db.SaveChangesAsync(ct);
+        _logger.LogInformation("Dispatched {Count} emails", pending.Count);
+    }
+}
+```
+
+### Why `IServiceScopeFactory` and Not Direct Injection of `DbContext`
+
+`BackgroundService` is a Singleton — it lives for the entire application
+lifetime. `DbContext` is Scoped — it should live for a single unit of work.
+If you inject `DbContext` directly into `BackgroundService`, you capture
+one DbContext forever (the captive dependency bug). All work cycles share
+the same stale, connection-leaking instance.
+
+The fix: inject `IServiceScopeFactory`, create a new scope per work cycle,
+resolve the Scoped services from that scope, then dispose it. This gives
+each cycle its own fresh DbContext with its own connection.
+
+---
+
+## 16.3 `PeriodicTimer` — The Modern Timer Pattern
+
+`PeriodicTimer` (introduced in .NET 6) is the preferred timer for
+background work. Unlike `System.Timers.Timer`, it does not fire callbacks
+on thread pool threads while your previous callback is still running —
+the next tick only becomes available after the previous one is awaited.
+This prevents concurrent execution of your work method with no extra
+synchronisation needed.
+
+```csharp
+using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
+while (await timer.WaitForNextTickAsync(ct))  // blocks until tick or cancellation
+{
+    await DoWorkAsync(ct);  // this FINISHES before the next tick is awaited
+}
+// If DoWorkAsync takes 4 minutes and the interval is 5 minutes,
+// the next tick comes 5 minutes after the PREVIOUS tick was awaited,
+// not 1 minute after work finishes. There is no overlap.
+```
+
+---
+
+## 16.4 `IHostedService` — Custom Lifecycle
+
+`BackgroundService` covers most cases. Use `IHostedService` directly when
+you need precise control over startup and shutdown sequencing — for example,
+a service that must acquire a resource during startup and release it at
+shutdown:
+
+```csharp
+public class DatabaseHealthChecker : IHostedService, IDisposable
+{
+    private Timer? _timer;
+    private readonly ILogger<DatabaseHealthChecker> _logger;
+
+    public DatabaseHealthChecker(ILogger<DatabaseHealthChecker> logger) =>
+        _logger = logger;
+
+    // Called by the host at startup — before the app is ready to serve requests
+    public Task StartAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("DB health checker starting");
+        _timer = new Timer(CheckHealth, null,
+            dueTime:  TimeSpan.Zero,
+            period:   TimeSpan.FromSeconds(30));
+        return Task.CompletedTask;
+    }
+
+    private void CheckHealth(object? state) { /* ... */ }
+
+    // Called by the host at shutdown — after all requests are drained
+    public Task StopAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("DB health checker stopping");
+        _timer?.Change(Timeout.Infinite, 0);
+        return Task.CompletedTask;
+    }
+
+    public void Dispose() => _timer?.Dispose();
+}
+
+services.AddSingleton<IHostedService, DatabaseHealthChecker>();
+```
+
+---
+
+## 16.5 Health Checks — Signalling Readiness and Liveness
+
+Health checks tell orchestrators (Kubernetes, load balancers) whether the
+service is healthy. There are two distinct signals:
+
+- **Liveness**: is the process running? If not, restart it.
+- **Readiness**: is the service ready to receive traffic? If not, remove
+  it from the load balancer until it is.
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>("database")   // pings the DB
+    .AddUrlGroup(new Uri("https://api.external.com/health"), "external-api")
+    .AddCheck("disk", () =>
+    {
+        var drive = new DriveInfo("/");
+        return drive.AvailableFreeSpace < 100_000_000   // < 100MB free
+            ? HealthCheckResult.Degraded("Disk space low")
+            : HealthCheckResult.Healthy();
+    });
+
+// Map health check endpoints
+app.MapHealthChecks("/health/live",  new HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+});
+```
+
+---
+
+## 16.6 Deploying as a systemd Service
+
+On Linux, the standard way to run a background service is as a systemd
+unit. `UseSystemd()` integrates the host's lifetime with systemd signals
+(SIGTERM for graceful stop, watchdog pings for health):
 
 ```bash
-dotnet new worker -n MyDaemon
+dotnet add package Microsoft.Extensions.Hosting.Systemd
 ```
-
-### Project Structure
-
-```
-MyDaemon/
-├── MyDaemon.csproj
-├── Program.cs
-├── appsettings.json
-├── appsettings.Development.json
-├── Workers/
-│   ├── SyncWorker.cs
-│   ├── CleanupWorker.cs
-│   └── HealthCheckWorker.cs
-└── Services/
-    ├── ISyncService.cs
-    └── SyncService.cs
-```
-
-### `.csproj`
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk.Worker">
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <RootNamespace>MyDaemon</RootNamespace>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
-    <PackageReference Include="Serilog.Extensions.Hosting" Version="9.0.0" />
-  </ItemGroup>
-</Project>
-```
-
-### `Program.cs`
 
 ```csharp
-using Serilog;
-
-Log.Logger = new LoggerConfiguration()
-    .WriteTo.Console()
-    .CreateBootstrapLogger();
-
-try
-{
-    var host = Host.CreateDefaultBuilder(args)
-        .UseSerilog((ctx, services, config) => config
-            .ReadFrom.Configuration(ctx.Configuration)
-            .ReadFrom.Services(services)
-            .Enrich.FromLogContext())
-        .ConfigureServices((ctx, services) =>
-        {
-            services.AddSingleton<ISyncService, SyncService>();
-            services.AddHostedService<SyncWorker>();
-            services.AddHostedService<CleanupWorker>();
-            services.Configure<SyncOptions>(ctx.Configuration.GetSection("Sync"));
-        })
-        .UseSystemd()      // enables systemd integration (Linux)
-        .UseWindowsService() // enables Windows Service integration
-        .Build();
-
-    await host.RunAsync();
-}
-catch (Exception ex)
-{
-    Log.Fatal(ex, "Host terminated unexpectedly");
-}
-finally
-{
-    await Log.CloseAndFlushAsync();
-}
+var host = Host.CreateDefaultBuilder(args)
+    .UseSystemd()        // integrate with systemd: SIGTERM → graceful shutdown
+    .ConfigureServices(...)
+    .Build();
+await host.RunAsync();
 ```
-
----
-
-## 16.2 BackgroundService
-
-`BackgroundService` is the base class for long-running services. It implements `IHostedService`.
-
-```csharp
-public class SyncWorker : BackgroundService
-{
-    private readonly ISyncService _sync;
-    private readonly IOptionsMonitor<SyncOptions> _opts;
-    private readonly ILogger<SyncWorker> _logger;
-
-    public SyncWorker(
-        ISyncService sync,
-        IOptionsMonitor<SyncOptions> opts,
-        ILogger<SyncWorker> logger)
-    {
-        _sync = sync;
-        _opts = opts;
-        _logger = logger;
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        _logger.LogInformation("SyncWorker started");
-
-        // Wait a bit for dependencies to warm up
-        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                using (_logger.BeginScope(new { RunId = Guid.NewGuid() }))
-                {
-                    await _sync.SyncAllAsync(stoppingToken);
-                }
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break; // graceful shutdown
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during sync cycle");
-            }
-
-            var delay = _opts.CurrentValue.Interval;
-            _logger.LogDebug("Next sync in {Delay}", delay);
-            await Task.Delay(delay, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
-        }
-
-        _logger.LogInformation("SyncWorker stopping");
-    }
-
-    public override async Task StopAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("SyncWorker stop requested");
-        await base.StopAsync(cancellationToken);
-    }
-}
-```
-
----
-
-## 16.3 Timer-Based Worker (Periodic Timer)
-
-```csharp
-// PeriodicTimer — clean, cancellation-friendly (NET 6+)
-public class CleanupWorker : BackgroundService
-{
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<CleanupWorker> _logger;
-
-    public CleanupWorker(IServiceScopeFactory scopeFactory, ILogger<CleanupWorker> logger)
-    {
-        _scopeFactory = scopeFactory;
-        _logger = logger;
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
-
-        while (await timer.WaitForNextTickAsync(stoppingToken))
-        {
-            _logger.LogInformation("Starting cleanup cycle");
-            try
-            {
-                using var scope = _scopeFactory.CreateScope();
-                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-                // Delete old sessions
-                var cutoff = DateTime.UtcNow.AddDays(-30);
-                int deleted = await db.Sessions
-                    .Where(s => s.ExpiresAt < cutoff)
-                    .ExecuteDeleteAsync(stoppingToken);
-
-                _logger.LogInformation("Deleted {Count} expired sessions", deleted);
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Cleanup failed");
-            }
-        }
-    }
-}
-```
-
----
-
-## 16.4 Scoped Services in BackgroundService
-
-`BackgroundService` is a singleton. To use scoped services (like `DbContext`), create a scope:
-
-```csharp
-public class DataProcessorWorker : BackgroundService
-{
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<DataProcessorWorker> _logger;
-    private readonly Channel<ProcessJob> _channel;
-
-    public DataProcessorWorker(
-        IServiceScopeFactory scopeFactory,
-        ILogger<DataProcessorWorker> logger)
-    {
-        _scopeFactory = scopeFactory;
-        _logger = logger;
-        _channel = Channel.CreateBounded<ProcessJob>(100);
-    }
-
-    // Expose writer for other services to enqueue work
-    public ChannelWriter<ProcessJob> Queue => _channel.Writer;
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        await foreach (var job in _channel.Reader.ReadAllAsync(stoppingToken))
-        {
-            using var scope = _scopeFactory.CreateScope();
-            var processor = scope.ServiceProvider.GetRequiredService<IJobProcessor>();
-
-            try
-            {
-                await processor.ProcessAsync(job, stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Job {JobId} failed", job.Id);
-            }
-        }
-    }
-}
-```
-
----
-
-## 16.5 IHostedService — Custom Lifecycle
-
-Implement `IHostedService` directly for more control:
-
-```csharp
-public class GrpcServerHostedService : IHostedService
-{
-    private WebApplication? _grpcApp;
-    private readonly IConfiguration _config;
-    private readonly ILogger<GrpcServerHostedService> _logger;
-
-    public GrpcServerHostedService(IConfiguration config, ILogger<GrpcServerHostedService> logger)
-    {
-        _config = config;
-        _logger = logger;
-    }
-
-    public async Task StartAsync(CancellationToken ct)
-    {
-        var builder = WebApplication.CreateBuilder();
-        builder.Services.AddGrpc();
-        builder.Services.AddSingleton<SyncServiceImpl>();
-        builder.WebHost.ConfigureKestrel(opts =>
-            opts.ListenUnixSocket("/run/syncdot/syncdot.sock", l =>
-                l.Protocols = HttpProtocols.Http2));
-
-        _grpcApp = builder.Build();
-        _grpcApp.MapGrpcService<SyncServiceImpl>();
-
-        _logger.LogInformation("Starting gRPC server on Unix socket");
-        await _grpcApp.StartAsync(ct);
-    }
-
-    public async Task StopAsync(CancellationToken ct)
-    {
-        _logger.LogInformation("Stopping gRPC server");
-        if (_grpcApp is not null)
-            await _grpcApp.StopAsync(ct);
-    }
-}
-```
-
----
-
-## 16.6 systemd Unit File
-
-Deploy a .NET worker as a `systemd` service on Linux:
 
 ```ini
-# /etc/systemd/system/syncdot.service
+# /etc/systemd/system/myapp-worker.service
 [Unit]
-Description=SyncDot P2P File Sync Daemon
+Description=My App Background Worker
 After=network.target
 
 [Service]
-Type=notify
-User=syncdot
-Group=syncdot
-WorkingDirectory=/opt/syncdot
-ExecStart=/opt/syncdot/SyncDot.Daemon
-Restart=on-failure
-RestartSec=5
-KillSignal=SIGTERM
-TimeoutStopSec=30
+Type=notify                              # tells systemd we support sd_notify
+ExecStart=/opt/myapp/MyApp.Worker        # path to published binary
+WorkingDirectory=/opt/myapp
+User=myapp
+Group=myapp
+Restart=always                           # restart if process exits
+RestartSec=10
+EnvironmentFile=/etc/myapp/secrets.env   # load secrets from file (chmod 600)
 
-# Environment
-Environment=DOTNET_ENVIRONMENT=Production
-Environment=ASPNETCORE_ENVIRONMENT=Production
-EnvironmentFile=/etc/syncdot/env
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=syncdot
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/syncdot /run/syncdot
+# Optional: resource limits
+MemoryMax=512M
+CPUQuota=50%
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
-# Install and start
 sudo systemctl daemon-reload
-sudo systemctl enable syncdot
-sudo systemctl start syncdot
-sudo systemctl status syncdot
-journalctl -u syncdot -f   # follow logs
-```
-
-### Enable systemd Notifications
-
-```csharp
-// Install: Microsoft.Extensions.Hosting.Systemd
-builder.Host.UseSystemd();
-// This enables:
-// - NOTIFY_SOCKET (sends sd_notify READY=1 when started)
-// - WATCHDOG_USEC (sends watchdog keepalive)
-// - Graceful shutdown on SIGTERM
+sudo systemctl enable myapp-worker
+sudo systemctl start myapp-worker
+sudo systemctl status myapp-worker
+sudo journalctl -u myapp-worker -f    # follow logs
 ```
 
 ---
 
-## 16.7 Health Checks
+## 16.7 Hangfire — Scheduled and Recurring Jobs
 
-```csharp
-// Registration
-services.AddHealthChecks()
-    .AddCheck("self", () => HealthCheckResult.Healthy("Running"))
-    .AddDbContextCheck<AppDbContext>("database")
-    .AddUrlGroup(new Uri("https://api.external.com/ping"), "external-api")
-    .AddCheck<SyncWorkerHealthCheck>("sync-worker");
+Hangfire is a library for jobs that need persistence (survive restarts),
+scheduling, retry policies, and a management dashboard. It stores job
+state in a database:
 
-// Custom health check
-public class SyncWorkerHealthCheck : IHealthCheck
-{
-    private readonly SyncWorker _worker;
-    public SyncWorkerHealthCheck(SyncWorker worker) => _worker = worker;
-
-    public Task<HealthCheckResult> CheckHealthAsync(
-        HealthCheckContext context, CancellationToken ct)
-    {
-        if (_worker.LastSyncAt < DateTime.UtcNow.AddMinutes(-15))
-            return Task.FromResult(HealthCheckResult.Degraded("Sync is overdue"));
-
-        return Task.FromResult(HealthCheckResult.Healthy($"Last sync: {_worker.LastSyncAt:O}"));
-    }
-}
-
-// Expose HTTP endpoint (if hosting HTTP as well)
-app.MapHealthChecks("/healthz");
-app.MapHealthChecks("/healthz/ready", new HealthCheckOptions
-{
-    Predicate = check => check.Tags.Contains("ready")
-});
-```
-
----
-
-## 16.8 Hangfire — Scheduled & Recurring Jobs
-
-```xml
-<PackageReference Include="Hangfire.AspNetCore" Version="1.8.14" />
-<PackageReference Include="Hangfire.InMemory" Version="0.10.1" /> <!-- for dev -->
-<PackageReference Include="Hangfire.PostgreSql" Version="1.20.9" /> <!-- for prod -->
+```bash
+dotnet add package Hangfire.AspNetCore
+dotnet add package Hangfire.Storage.SQLite  # or Hangfire.PostgreSql
 ```
 
 ```csharp
-// Registration
-builder.Services.AddHangfire(config => config
-    .UseSimpleAssemblyNameTypeSerializer()
-    .UseRecommendedSerializerSettings()
-    .UsePostgreSqlStorage(connectionString));
+builder.Services.AddHangfire(cfg => cfg.UseSQLiteStorage("hangfire.db"));
+builder.Services.AddHangfireServer(opts => opts.WorkerCount = 4);
 
-builder.Services.AddHangfireServer(opts =>
-{
-    opts.WorkerCount = 5;
-    opts.Queues = new[] { "critical", "default", "low" };
-});
+// In Program.cs after Build():
+app.MapHangfireDashboard("/jobs");  // management UI
 
-// Schedule jobs
-app.MapHangfireDashboard("/hangfire"); // admin dashboard
+// Enqueue a job (runs as soon as a worker is available)
+BackgroundJob.Enqueue<IInvoiceService>(svc => svc.GenerateMonthlyInvoices());
 
-// Fire-and-forget
-BackgroundJob.Enqueue<IEmailService>(email => email.SendAsync("alice@example.com", "Welcome!"));
+// Schedule a job in the future
+BackgroundJob.Schedule<IReportService>(
+    svc => svc.GenerateDailyReport(),
+    TimeSpan.FromHours(1));
 
-// Delayed
-BackgroundJob.Schedule<ICleanupService>(
+// Recurring job (cron expression)
+RecurringJob.AddOrUpdate<ICleanupService>(
+    "cleanup-old-files",
     svc => svc.CleanOldFilesAsync(),
-    delay: TimeSpan.FromMinutes(30));
-
-// Recurring
-RecurringJob.AddOrUpdate<IReportService>(
-    "daily-report",
-    svc => svc.GenerateDailyReportAsync(),
-    Cron.Daily(hour: 2));   // every day at 2 AM
-
-// Continuations
-var jobId = BackgroundJob.Enqueue<IOrderService>(svc => svc.ProcessAsync(orderId));
-BackgroundJob.ContinueJobWith<INotificationService>(
-    jobId,
-    svc => svc.NotifyAsync(orderId));
+    Cron.Daily(hour: 2));   // 2am every day
 ```
 
-> **Rider tip:** Use *Run → Run Configurations* to create a configuration for the worker service with specific environment variables (`DOTNET_ENVIRONMENT=Development`). Rider shows background service logs in the *Run* tab with color coding by log level.
+---
 
-> **VS tip:** *Debug → Attach to Process* lets you attach the debugger to a running service. Set breakpoints inside `ExecuteAsync` and they'll be hit on the next iteration.
+## 16.8 Connecting Workers to the Rest of the Book
 
+- **Ch 8 (Async)** — `CancellationToken` is the entire mechanism for
+  graceful worker shutdown. Every async operation in the worker should
+  accept and propagate it.
+- **Ch 11 §11.8 (DI)** — the `IServiceScopeFactory` pattern is mandatory
+  for using Scoped services from a Singleton BackgroundService.
+- **Ch 35 (Pet Projects — Daemons)** — complete file watcher, log tail,
+  and job runner daemons built on this chapter's foundations.
+- **Ch 30 (Observability)** — background services need metrics and
+  distributed tracing just as much as API endpoints. OpenTelemetry
+  works in BackgroundService.

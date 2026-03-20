@@ -1,469 +1,376 @@
-# Chapter 12 — IO: Streams, Pipelines & File System
+# Chapter 12 — IO: Streams, Pipelines & the File System
 
-## 12.1 File and Directory Operations
+> Every useful program reads or writes something: files, network sockets,
+> database connections, standard input/output. In .NET, all of these are
+> expressed through a single abstraction: the Stream. Understanding
+> streams is understanding how all I/O in .NET works. This chapter
+> builds from the concept of a stream up through file operations,
+> pipelines, and file watching.
 
-```csharp
-// File — static convenience methods (for small files)
-string   text = File.ReadAllText("data.txt");
-string[] lines = File.ReadAllLines("data.txt");
-byte[]   bytes = File.ReadAllBytes("image.png");
-
-File.WriteAllText("out.txt", "Hello, World!");
-File.WriteAllLines("out.txt", new[] { "line 1", "line 2", "line 3" });
-File.WriteAllBytes("out.bin", buffer);
-
-// Append
-File.AppendAllText("log.txt", $"[{DateTime.Now}] Event happened\n");
-
-// Copy / Move / Delete
-File.Copy("src.txt", "dst.txt", overwrite: true);
-File.Move("old.txt", "new.txt", overwrite: true);
-File.Delete("unwanted.txt");
-
-// Existence
-bool exists = File.Exists("data.txt");
-
-// Metadata
-DateTime created  = File.GetCreationTimeUtc("data.txt");
-DateTime modified = File.GetLastWriteTimeUtc("data.txt");
-long size = new FileInfo("data.txt").Length;
-
-// Directory
-Directory.CreateDirectory("path/to/dir");  // creates all intermediate dirs
-Directory.Delete("path/to/dir", recursive: true);
-bool dirExists = Directory.Exists("path");
-
-// Enumerate (lazy — better for large dirs)
-foreach (var file in Directory.EnumerateFiles("src", "*.cs", SearchOption.AllDirectories))
-    Console.WriteLine(file);
-
-foreach (var dir in Directory.EnumerateDirectories("src", "*", SearchOption.TopDirectoryOnly))
-    Console.WriteLine(dir);
-
-// Path manipulation
-string full   = Path.GetFullPath("../file.txt");
-string dir2   = Path.GetDirectoryName("/a/b/c.txt")!; // "/a/b"
-string name   = Path.GetFileName("/a/b/c.txt");        // "c.txt"
-string noExt  = Path.GetFileNameWithoutExtension("/a/b/c.txt"); // "c"
-string ext    = Path.GetExtension("/a/b/c.txt");       // ".txt"
-string joined = Path.Combine("a", "b", "c.txt");       // "a/b/c.txt" (OS-aware)
-string temp   = Path.GetTempFileName();                 // creates temp file
-string tempDir = Path.GetTempPath();
-
-// OS-independent path separator
-char sep = Path.DirectorySeparatorChar; // '\' on Windows, '/' on Linux
-```
+*Building on:* Ch 2 (types, value vs reference, IDisposable), Ch 3
+(`using` statements), Ch 8 (async/await — all I/O should be async)
 
 ---
 
-## 12.2 Streams
+## 12.1 What a Stream Is and Why It Exists
 
-The `Stream` class is the base for all streaming I/O.
+A stream is an abstraction over a sequence of bytes. The sequence might
+come from a file on disk, from a network socket, from a database blob,
+from memory, or from any other byte source. The key design insight is
+that the consumer does not need to know the source — they just read
+bytes, and the stream provides them.
 
-### FileStream — Low-Level File Access
+This abstraction enables composition: you can wrap one stream in another.
+A `GZipStream` wrapping a `FileStream` reads from a file and decompresses
+on the fly. A `CryptoStream` wrapping a `NetworkStream` encrypts bytes as
+they are sent over the network. Neither wrapper knows about the other's
+source.
+
+```
+Your code
+    ↓ reads/writes bytes
+[CryptoStream]        ← encrypts/decrypts
+    ↓ reads/writes bytes
+[GZipStream]          ← compresses/decompresses
+    ↓ reads/writes bytes
+[BufferedStream]      ← buffers to reduce syscall count
+    ↓ reads/writes bytes
+[FileStream]          ← reads/writes the actual file on disk
+```
 
 ```csharp
-// Read file in chunks — for large files
-await using var fs = new FileStream("large.bin",
-    FileMode.Open,
-    FileAccess.Read,
-    FileShare.Read,
-    bufferSize: 65536,          // 64KB buffer
-    useAsync: true);            // use IOCP (async I/O)
+// The base class all streams extend
+public abstract class Stream : IDisposable, IAsyncDisposable
+{
+    // Read bytes into a buffer
+    public abstract int Read(byte[] buffer, int offset, int count);
+    public abstract ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct);
 
-var buffer = new byte[65536];
+    // Write bytes from a buffer
+    public abstract void Write(byte[] buffer, int offset, int count);
+    public abstract Task WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct);
+
+    // Seek (if the stream supports random access)
+    public abstract long Seek(long offset, SeekOrigin origin);
+    public abstract long Position { get; set; }
+    public abstract long Length   { get; }
+    public abstract bool CanSeek  { get; }   // false for network streams
+    public abstract bool CanRead  { get; }
+    public abstract bool CanWrite { get; }
+}
+```
+
+Not all streams are seekable. A `NetworkStream` is a fire-hose — bytes
+arrive in order and cannot be re-read. A `FileStream` supports seeking
+to any position. Always check `CanSeek` before calling `Seek`.
+
+Always close streams (use `using` or `await using`) — they hold OS
+file handles, network connections, or system resources that cannot be
+garbage-collected.
+
+---
+
+## 12.2 FileStream — Reading and Writing Files
+
+`FileStream` is the lowest-level way to work with files. For text,
+`StreamReader` and `StreamWriter` wrap it and handle encoding. For
+high-level file operations, `File` provides convenient static methods.
+
+```csharp
+// Reading a file — choose the right abstraction for your use case
+
+// For small text files: simplest, loads entire file into memory
+string text = await File.ReadAllTextAsync("config.json", ct);
+
+// For large text files: line by line, no memory spike
+await foreach (var line in File.ReadLinesAsync("large.log", ct))
+    Process(line);    // each line processed immediately, not buffered
+
+// For binary data: raw bytes
+byte[] data = await File.ReadAllBytesAsync("image.png", ct);
+
+// For streaming binary: process as data arrives, no full load
+await using var fs = new FileStream("large.bin", FileMode.Open, FileAccess.Read,
+    FileShare.Read, bufferSize: 4096, useAsync: true);
+var buffer = new byte[4096];
 int bytesRead;
-while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
-{
-    ProcessChunk(buffer.AsSpan(0, bytesRead));
-}
-
-// Modern Memory<byte> overload
-while ((bytesRead = await fs.ReadAsync(buffer.AsMemory())) > 0)
-{
-    Process(buffer.AsSpan(0, bytesRead));
-}
-
-// Write file
-await using var writer = new FileStream("out.bin", FileMode.Create, FileAccess.Write,
-    FileShare.None, 65536, true);
-await writer.WriteAsync(data.AsMemory());
-await writer.FlushAsync();
+while ((bytesRead = await fs.ReadAsync(buffer, ct)) > 0)
+    await ProcessChunkAsync(buffer[..bytesRead], ct);
 ```
 
-### StreamReader / StreamWriter — Text
-
 ```csharp
-// Read text file
-await using var reader = new StreamReader("data.txt", Encoding.UTF8,
-    detectEncodingFromByteOrderMarks: true);
+// Writing files
 
-// Line by line
-string? line;
-while ((line = await reader.ReadLineAsync()) is not null)
-{
-    ProcessLine(line);
-}
+// Simple text or binary
+await File.WriteAllTextAsync("output.txt", content, ct);
+await File.WriteAllBytesAsync("output.bin", data, ct);
 
-// Or (C# 13+) — ReadLinesAsync
-await foreach (var l in File.ReadLinesAsync("data.txt"))
-    ProcessLine(l);
+// Streaming write — for large output that should not all be in memory at once
+await using var output = new StreamWriter("output.txt", append: false, Encoding.UTF8);
+await foreach (var record in GetRecordsAsync(ct))
+    await output.WriteLineAsync(record.ToCsv());
+// File is flushed and closed when StreamWriter is disposed
 
-// All text
-string all = await reader.ReadToEndAsync();
-
-// Write text
-await using var sw = new StreamWriter("out.txt", append: false, Encoding.UTF8);
-await sw.WriteLineAsync("First line");
-await sw.WriteAsync("No newline");
-await sw.FlushAsync();
+// Append to existing file
+await using var log = File.AppendText("events.log");
+await log.WriteLineAsync($"{DateTime.UtcNow:O} {message}");
 ```
 
-### MemoryStream
+### File Operations — `File`, `Directory`, `Path`
 
 ```csharp
-// In-memory stream — good for testing and buffering
-using var ms = new MemoryStream();
-using var sw = new StreamWriter(ms, Encoding.UTF8, leaveOpen: true);
-await sw.WriteLineAsync("Hello");
-await sw.FlushAsync();
+// File existence and metadata
+bool exists = File.Exists("myfile.txt");
+var info    = new FileInfo("myfile.txt");
+Console.WriteLine($"Size: {info.Length}, Modified: {info.LastWriteTime}");
 
-ms.Seek(0, SeekOrigin.Begin); // rewind
-using var sr = new StreamReader(ms, Encoding.UTF8);
-string text = await sr.ReadToEndAsync(); // "Hello\n"
+// Copy, move, delete
+File.Copy("source.txt", "dest.txt", overwrite: true);
+File.Move("old.txt", "new.txt", overwrite: false);
+File.Delete("temp.txt");
 
-// Get underlying array
-byte[] bytes = ms.ToArray();
-ReadOnlyMemory<byte> mem = ms.GetBuffer().AsMemory(0, (int)ms.Length);
-```
+// Directory operations
+Directory.CreateDirectory("output/reports");   // creates all intermediate dirs
+var files = Directory.EnumerateFiles("logs", "*.log", SearchOption.AllDirectories);
+Directory.Delete("old-output", recursive: true);
 
-### BinaryReader / BinaryWriter — Typed Primitives
-
-```csharp
-// Write binary data
-await using var fs = new FileStream("data.bin", FileMode.Create);
-using var bw = new BinaryWriter(fs, Encoding.UTF8, leaveOpen: true);
-bw.Write(42);           // int (4 bytes)
-bw.Write(3.14f);        // float (4 bytes)
-bw.Write("hello");      // length-prefixed string
-bw.Write(true);         // bool (1 byte)
-
-// Read binary data
-fs.Seek(0, SeekOrigin.Begin);
-using var br = new BinaryReader(fs, Encoding.UTF8, leaveOpen: true);
-int n    = br.ReadInt32();
-float f  = br.ReadSingle();
-string s = br.ReadString();
-bool b   = br.ReadBoolean();
-```
-
-### Compression
-
-```csharp
-using System.IO.Compression;
-
-// GZip compress
-await using var fs = new FileStream("out.gz", FileMode.Create);
-await using var gz = new GZipStream(fs, CompressionLevel.Optimal);
-await using var sw = new StreamWriter(gz);
-await sw.WriteAsync(largeText);
-
-// GZip decompress
-await using var fs2 = new FileStream("out.gz", FileMode.Open);
-await using var gz2 = new GZipStream(fs2, CompressionMode.Decompress);
-await using var sr  = new StreamReader(gz2);
-string decompressed = await sr.ReadToEndAsync();
-
-// In-memory compression
-using var compressed = new MemoryStream();
-using (var gz3 = new GZipStream(compressed, CompressionLevel.Fastest, leaveOpen: true))
-    await gz3.WriteAsync(sourceBytes);
-byte[] result = compressed.ToArray();
-
-// ZipArchive — work with ZIP files
-using var archive = ZipFile.OpenRead("archive.zip");
-foreach (var entry in archive.Entries)
-{
-    using var entryStream = entry.Open();
-    // process entryStream
-}
-
-// Create ZIP
-using var newZip = ZipFile.Open("new.zip", ZipArchiveMode.Create);
-newZip.CreateEntryFromFile("file.txt", "file.txt", CompressionLevel.Optimal);
+// Path manipulation — always use Path, never string concatenation
+string full    = Path.Combine("/home/user", "docs", "report.pdf");
+string dir     = Path.GetDirectoryName(full)!;   // /home/user/docs
+string name    = Path.GetFileName(full);          // report.pdf
+string noExt   = Path.GetFileNameWithoutExtension(full); // report
+string ext     = Path.GetExtension(full);         // .pdf
+string temp    = Path.GetTempPath();              // OS temp directory
+string tmpFile = Path.GetTempFileName();          // creates a temp file, returns path
 ```
 
 ---
 
-## 12.3 System.IO.Pipelines
+## 12.3 `StreamReader` and `StreamWriter` — Text Streams
 
-Pipelines provide high-performance, low-allocation I/O. Used internally by ASP.NET Core, Kestrel, gRPC.
+File systems store bytes. Text has encoding. `StreamReader`/`StreamWriter`
+bridge the gap — they decode bytes to characters using a specified
+encoding (UTF-8 by default):
 
 ```csharp
-using System.IO.Pipelines;
-
-// Basic pipe
-var pipe = new Pipe();
-
-// Writer side
-async Task ProduceAsync(PipeWriter writer)
+// Read CSV with explicit encoding
+await using var reader = new StreamReader("data.csv", Encoding.UTF8);
+string? line;
+while ((line = await reader.ReadLineAsync(ct)) is not null)
 {
-    for (int i = 0; i < 100; i++)
-    {
-        var buffer = writer.GetMemory(256);  // request buffer
-        int written = Encode(i, buffer.Span); // write into buffer
-        writer.Advance(written);             // tell writer how much we wrote
-
-        var flush = await writer.FlushAsync();
-        if (flush.IsCompleted) break;
-    }
-    await writer.CompleteAsync();
+    var columns = line.Split(',');
+    // ...
 }
 
-// Reader side
-async Task ConsumeAsync(PipeReader reader)
+// Write JSON with BOM (some legacy systems require it)
+await using var writer = new StreamWriter("output.json",
+    new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write },
+    new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));  // UTF-8 with BOM
+await writer.WriteAsync(jsonContent);
+```
+
+---
+
+## 12.4 `System.IO.Pipelines` — High-Throughput IO
+
+`System.IO.Pipelines` (introduced in .NET Core 2.1) is designed for
+writing high-throughput network servers and parsers. The BCL's `Stream`
+API has an ergonomic friction: you must provide a buffer, read into it,
+then parse it. Tracking positions, handling partial reads, and managing
+buffer reuse is complex and error-prone.
+
+Pipelines solve this with two abstractions:
+- `PipeWriter` — the producer writes data into the pipe
+- `PipeReader` — the consumer reads data from the pipe in chunks, telling
+  the pipe which bytes it has consumed
+
+The system manages buffer allocation and reuse automatically:
+
+```csharp
+// Parse a line-delimited text stream efficiently
+static async Task ParseLinesAsync(PipeReader reader, CancellationToken ct)
 {
     while (true)
     {
-        var result = await reader.ReadAsync();
-        var buffer = result.Buffer;
+        ReadResult result = await reader.ReadAsync(ct);
+        ReadOnlySequence<byte> buffer = result.Buffer;
 
         while (TryReadLine(ref buffer, out ReadOnlySequence<byte> line))
         {
-            ProcessLine(line);
+            ProcessLine(line);   // work with the line without copying
         }
 
+        // Tell the pipe we consumed everything up to here
         reader.AdvanceTo(buffer.Start, buffer.End);
 
-        if (result.IsCompleted) break;
+        if (result.IsCompleted) break;  // no more data
     }
     await reader.CompleteAsync();
 }
 
-bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
+static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
 {
     var position = buffer.PositionOf((byte)'\n');
-    if (position == null) { line = default; return false; }
+    if (position == null)
+    {
+        line = default;
+        return false;
+    }
     line = buffer.Slice(0, position.Value);
     buffer = buffer.Slice(buffer.GetPosition(1, position.Value));
     return true;
 }
-
-// Wire up
-var producer = ProduceAsync(pipe.Writer);
-var consumer = ConsumeAsync(pipe.Reader);
-await Task.WhenAll(producer, consumer);
-
-// Stream to PipeReader adapter
-PipeReader fromStream = PipeReader.Create(networkStream, new StreamPipeReaderOptions(
-    bufferSize: 65536,
-    minimumReadSize: 4096,
-    leaveOpen: false));
 ```
+
+Pipelines are used internally by ASP.NET Core's Kestrel server to parse
+HTTP requests at very high throughput. You rarely write pipeline code
+directly in application code, but understanding it explains why Kestrel
+is fast.
 
 ---
 
-## 12.4 FileSystemWatcher
+## 12.5 `FileSystemWatcher` — Reacting to File System Changes
+
+Rather than polling a directory for changes, `FileSystemWatcher` uses the
+OS's notification mechanism (inotify on Linux, ReadDirectoryChangesW on
+Windows, FSEvents on macOS) to get notified immediately when a file is
+created, modified, deleted, or renamed.
 
 ```csharp
-using var watcher = new FileSystemWatcher("./sync-root")
+// Watch a directory for changes
+using var watcher = new FileSystemWatcher("/var/data/uploads")
 {
-    NotifyFilter = NotifyFilters.FileName
-                 | NotifyFilters.DirectoryName
-                 | NotifyFilters.LastWrite
-                 | NotifyFilters.Size,
-    Filter = "*",                    // all files
-    IncludeSubdirectories = true,
-    EnableRaisingEvents = true,      // must be true to start watching
-    InternalBufferSize = 65536,      // increase to reduce missed events (default 8192)
+    Filter                = "*.csv",               // only CSV files
+    IncludeSubdirectories = false,
+    NotifyFilter          = NotifyFilters.FileName
+                          | NotifyFilters.LastWrite
+                          | NotifyFilters.Size,
+    EnableRaisingEvents   = true
 };
 
-watcher.Created += (sender, e) =>
-    Console.WriteLine($"Created: {e.FullPath}");
-
-watcher.Changed += (sender, e) =>
-    Console.WriteLine($"Changed: {e.FullPath}");
-
-watcher.Deleted += (sender, e) =>
-    Console.WriteLine($"Deleted: {e.FullPath}");
-
-watcher.Renamed += (sender, e) =>
-    Console.WriteLine($"Renamed: {e.OldFullPath} → {e.FullPath}");
-
-watcher.Error += (sender, e) =>
+// Events fire on a background thread — must be thread-safe
+watcher.Created += async (_, e) =>
 {
-    var ex = e.GetException();
-    Console.Error.WriteLine($"Watcher error: {ex.Message}");
-    // InternalBufferOverflowException means events were dropped — rescan!
-    if (ex is InternalBufferOverflowException)
-        TriggerFullRescan();
+    // New file appeared — wait briefly for the write to complete
+    await Task.Delay(500);   // debounce
+    await ProcessFileAsync(e.FullPath, CancellationToken.None);
 };
+
+watcher.Changed += (_, e) =>
+    Console.WriteLine($"Modified: {e.FullPath}");
+
+watcher.Error += (_, e) =>
+    Console.WriteLine($"Watch error: {e.GetException().Message}");
+
+// Keep the program alive
+await Task.Delay(Timeout.Infinite);
 ```
 
-### Debounced File Watcher
+### Debouncing — The Essential Pattern
+
+File editors typically save a file in multiple write operations. Without
+debouncing, you receive multiple `Changed` events for a single logical
+save. The standard fix is to delay processing until changes have settled:
 
 ```csharp
-// Debounce rapid-fire events (e.g., save triggers 5 events for same file)
-public class DebouncedWatcher : IDisposable
+// Debounce: only process after 500ms of no new events for the same file
+private readonly Dictionary<string, CancellationTokenSource> _pending = new();
+
+void OnChanged(string path)
 {
-    private readonly FileSystemWatcher _watcher;
-    private readonly ConcurrentDictionary<string, Timer> _timers = new();
-    private readonly TimeSpan _delay;
-    private readonly Action<string> _onChange;
+    if (_pending.TryGetValue(path, out var existingCts))
+        existingCts.Cancel();  // cancel any pending process for this file
 
-    public DebouncedWatcher(string path, TimeSpan delay, Action<string> onChange)
-    {
-        _delay = delay;
-        _onChange = onChange;
-        _watcher = new FileSystemWatcher(path)
-        {
-            IncludeSubdirectories = true,
-            EnableRaisingEvents = true,
-            InternalBufferSize = 65536,
-        };
-        _watcher.Changed += OnChange;
-        _watcher.Created += OnChange;
-    }
+    var cts = new CancellationTokenSource();
+    _pending[path] = cts;
 
-    private void OnChange(object sender, FileSystemEventArgs e)
-    {
-        var timer = _timers.AddOrUpdate(e.FullPath,
-            _ => new Timer(Callback, e.FullPath, _delay, Timeout.InfiniteTimeSpan),
-            (_, t) => { t.Change(_delay, Timeout.InfiniteTimeSpan); return t; });
-    }
-
-    private void Callback(object? state)
-    {
-        var path = (string)state!;
-        _timers.TryRemove(path, out var t);
-        t?.Dispose();
-        _onChange(path);
-    }
-
-    public void Dispose()
-    {
-        _watcher.Dispose();
-        foreach (var t in _timers.Values) t.Dispose();
-    }
+    _ = Task.Delay(500, cts.Token)
+            .ContinueWith(t =>
+            {
+                if (!t.IsCanceled)
+                    ProcessFile(path);
+            });
 }
 ```
 
----
-
-## 12.5 Path Utilities and Cross-Platform Paths
-
-```csharp
-// Never hardcode path separators
-// BAD:
-string path = "data" + "/" + "file.txt"; // fails on Windows with backslash mismatch
-// GOOD:
-string path2 = Path.Combine("data", "file.txt"); // uses OS separator
-
-// Special folders
-string home     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-string appData  = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-string desktop  = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-string docDir   = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-string tempDir2 = Path.GetTempPath(); // /tmp on Linux, %TEMP% on Windows
-
-// Relative to executable
-string exeDir = AppContext.BaseDirectory;
-string config = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-
-// Glob patterns — use Microsoft.Extensions.FileSystemGlobbing
-using Microsoft.Extensions.FileSystemGlobbing;
-var matcher = new Matcher();
-matcher.AddInclude("**/*.cs");
-matcher.AddExclude("**/obj/**");
-matcher.AddExclude("**/bin/**");
-
-var results = matcher.GetResultsInFullPath("./src");
-foreach (var file in results) Console.WriteLine(file);
-```
+Chapter 35 (Pet Projects III — Daemons) builds a complete file watcher
+daemon using this pattern with `Channel<T>` to decouple detection from
+processing.
 
 ---
 
-## 12.6 Serialization
+## 12.6 Serialisation — Turning Objects into Bytes and Back
 
-### System.Text.Json (Built-in, Fast)
+Serialisation is the process of converting an object to a byte sequence
+(for storage or transmission) and deserialisation is the reverse. .NET
+provides two main serialisers: `System.Text.Json` (built-in, fast,
+AOT-compatible) and Newtonsoft.Json (third-party, more flexible).
+
+### `System.Text.Json` — The Modern Standard
 
 ```csharp
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
-// Serialize
-var user = new User { Name = "Alice", Age = 30 };
-string json = JsonSerializer.Serialize(user);
-// {"name":"Alice","age":30}
-
-string prettyJson = JsonSerializer.Serialize(user, new JsonSerializerOptions
+// Serialise to JSON
+var order = new Order { Id = 1, Customer = "Alice", Total = 99.99m };
+string json = JsonSerializer.Serialize(order, new JsonSerializerOptions
 {
-    WriteIndented = true,
-    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    WriteIndented        = true,
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase  // { "id": 1, "customer": "Alice" }
 });
 
-// Deserialize
-User? user2 = JsonSerializer.Deserialize<User>(json);
-var userFromJson = JsonSerializer.Deserialize<User>("{\"name\":\"Bob\",\"age\":25}");
+// Deserialise from JSON
+Order? restored = JsonSerializer.Deserialize<Order>(json);
 
-// From stream (efficient — no string intermediate)
-await using var fs = new FileStream("data.json", FileMode.Open);
-User? fromFile = await JsonSerializer.DeserializeAsync<User>(fs);
+// Stream-based — avoids loading entire JSON string into memory
+await using var stream = File.OpenRead("data.json");
+var items = await JsonSerializer.DeserializeAsync<List<Order>>(stream, ct: ct);
 
-// Source generation (NET 7+ — AOT-friendly, faster)
-[JsonSerializable(typeof(User))]
-[JsonSerializable(typeof(List<User>))]
-internal partial class UserJsonContext : JsonSerializerContext { }
+// Source generation — faster startup, AOT-compatible
+[JsonSerializable(typeof(Order))]
+[JsonSerializable(typeof(List<Order>))]
+public partial class OrderJsonContext : JsonSerializerContext { }
 
-string json2 = JsonSerializer.Serialize(user, UserJsonContext.Default.User);
-User? u = JsonSerializer.Deserialize(json2, UserJsonContext.Default.User);
+// Use with the source-generated context
+var json2 = JsonSerializer.Serialize(order, OrderJsonContext.Default.Order);
+```
 
-// Custom converter
-public class DateOnlyJsonConverter : JsonConverter<DateOnly>
+### Custom Converters
+
+For types that do not serialise naturally (enums as strings, custom date
+formats, domain primitives):
+
+```csharp
+public class MoneyJsonConverter : JsonConverter<Money>
 {
-    public override DateOnly Read(ref Utf8JsonReader reader, Type t, JsonSerializerOptions opts)
-        => DateOnly.Parse(reader.GetString()!);
+    public override Money Read(ref Utf8JsonReader reader, Type t, JsonSerializerOptions opts)
+    {
+        var text = reader.GetString()!;  // "9.99 EUR"
+        var parts = text.Split(' ');
+        return new Money(decimal.Parse(parts[0]), parts[1]);
+    }
 
-    public override void Write(Utf8JsonWriter writer, DateOnly value, JsonSerializerOptions opts)
-        => writer.WriteStringValue(value.ToString("yyyy-MM-dd"));
+    public override void Write(Utf8JsonWriter writer, Money value, JsonSerializerOptions opts) =>
+        writer.WriteStringValue($"{value.Amount:F2} {value.Currency}");
 }
 
 // Register
 var opts = new JsonSerializerOptions();
-opts.Converters.Add(new DateOnlyJsonConverter());
+opts.Converters.Add(new MoneyJsonConverter());
 ```
 
-### JsonSerializerOptions — Recommended Configuration
+---
 
-```csharp
-// App-wide shared options (create once, reuse)
-public static class JsonOptions
-{
-    public static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web)
-    {
-        // JsonSerializerDefaults.Web:
-        // - CamelCase property names
-        // - case-insensitive deserialization
-        // - number tolerant (accepts string "42" as int)
-    };
+## 12.7 Connecting IO to the Rest of the Book
 
-    public static readonly JsonSerializerOptions Strict = new()
-    {
-        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = false,
-        WriteIndented               = false,
-        DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
-        Converters =
-        {
-            new JsonStringEnumConverter(JsonNamingPolicy.CamelCase),
-            new DateOnlyJsonConverter(),
-        }
-    };
-}
-```
-
-> **Rider tip:** *Tools → Postfix Templates* → type `.toJson` after an object to get a snippet that calls `JsonSerializer.Serialize()`. Also, *Rider → HTTP Client* (`Tools → HTTP Client`) lets you send requests and inspect JSON responses without leaving the IDE.
-
-> **VS tip:** *Edit → Paste Special → Paste JSON as Classes* automatically generates C# record/class definitions from JSON. Very useful when integrating with external APIs.
-
+- **Ch 8 (Async)** — All file and stream operations have async variants.
+  Always use `ReadAsync`/`WriteAsync` rather than blocking `Read`/`Write`
+  in async code. `IAsyncEnumerable<T>` from `File.ReadLinesAsync` pairs
+  with `await foreach` for lazy file processing.
+- **Ch 13 (Networking)** — `HttpClient` response bodies are `Stream`
+  objects. You can read them with `StreamReader`, pass them to a
+  `JsonSerializer`, or pipe them to a file.
+- **Ch 15 (EF Core)** — BLOB columns in databases are often read via
+  `Stream`. EF Core supports streaming large binary data.
+- **Ch 26 (Memory)** — `Span<T>`, `Memory<T>`, and `ArrayPool<T>` are
+  the tools for zero-copy buffer management in IO-heavy code.
+- **Ch 35 (Pet Projects — Daemons)** — a complete FileSystemWatcher
+  daemon with debounce, Channel<T> pipeline, and JSONL logging.

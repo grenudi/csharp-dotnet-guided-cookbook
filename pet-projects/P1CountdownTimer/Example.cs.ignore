@@ -1,0 +1,22 @@
+﻿// dotnet new console -n CountdownTimer
+// dotnet run -- 10
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+int seconds = args.Length > 0 && int.TryParse(args[0], out var n) ? n : 10;
+
+Console.WriteLine($"Counting down from {seconds}s. Press Ctrl+C to cancel.");
+
+for (int i = seconds; i > 0; i--)
+{
+    Console.Write($"\r  {i:00}s remaining...  ");
+    try   { await Task.Delay(1000, cts.Token); }
+    catch (OperationCanceledException) { Console.WriteLine("\nCancelled."); return; }
+}
+
+Console.Write("\r  0s — ");
+Console.Write("\a");    // BEL character — terminal bell
+Console.ForegroundColor = ConsoleColor.Green;
+Console.WriteLine("Done! ✓           ");
+Console.ResetColor();

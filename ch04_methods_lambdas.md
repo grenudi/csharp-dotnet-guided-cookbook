@@ -1,536 +1,498 @@
 # Chapter 4 — Methods, Delegates, Lambdas & Functional Patterns
 
-## 4.1 Method Signatures
+> Functions are the basic unit of computation. This chapter starts from
+> method signatures and works outward to delegates, lambdas, and the
+> functional patterns that make modern C# expressive and composable.
+> Understanding delegates is essential groundwork for async/await
+> (Ch 8), LINQ (Ch 7), events, and dependency injection (Ch 10–11).
 
-```csharp
-// Basic method
-public string Greet(string name) => $"Hello, {name}!";
-
-// Multiple parameters
-public static double Hypotenuse(double a, double b)
-    => Math.Sqrt(a * a + b * b);
-
-// ref parameters — pass by reference, must be pre-initialized
-public static void Swap<T>(ref T a, ref T b)
-{
-    T tmp = a; a = b; b = tmp;
-}
-
-int x = 1, y = 2;
-Swap(ref x, ref y); // x=2, y=1
-
-// out parameters — must be assigned before method returns
-public static bool TryDivide(int a, int b, out double result)
-{
-    if (b == 0) { result = 0; return false; }
-    result = (double)a / b;
-    return true;
-}
-
-if (TryDivide(10, 3, out var r)) Console.WriteLine(r); // 3.333...
-TryDivide(10, 0, out _); // discard out param
-
-// in parameters — read-only by-reference (avoids copy for large structs)
-public static double DotProduct(in Vector3 a, in Vector3 b)
-    => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
-```
-
-### Optional Parameters and Named Arguments
-
-```csharp
-public string Format(
-    string text,
-    int maxLength = 100,
-    bool ellipsis = true,
-    string separator = ", ")
-{
-    if (text.Length <= maxLength) return text;
-    return ellipsis ? text[..maxLength] + "…" : text[..maxLength];
-}
-
-// Call with named arguments — order doesn't matter
-var s1 = Format("hello", maxLength: 5, ellipsis: false);
-var s2 = Format(text: "hello", separator: " | ", maxLength: 50);
-```
-
-### params — Variable-Length Arguments
-
-```csharp
-public static int Sum(params int[] values)
-    => values.Sum();
-
-public static string Concat(string separator, params string[] parts)
-    => string.Join(separator, parts);
-
-// params IEnumerable<T> / params ReadOnlySpan<T> (C# 13+)
-public static T Max<T>(params ReadOnlySpan<T> values) where T : IComparable<T>
-{
-    if (values.IsEmpty) throw new ArgumentException("No values");
-    T max = values[0];
-    foreach (var v in values[1..])
-        if (v.CompareTo(max) > 0) max = v;
-    return max;
-}
-
-int total = Sum(1, 2, 3, 4, 5);           // 15
-string s   = Concat(", ", "a", "b", "c"); // "a, b, c"
-int biggest = Max(3, 1, 4, 1, 5, 9, 2);  // 9
-```
+*Building on:* Ch 2 (generics, type system), Ch 3 (control flow, pattern matching)
 
 ---
 
-## 4.2 Local Functions
+## 4.1 Method Signatures — What They Actually Mean
 
-Defined inside another method — they can capture outer variables (closures) or be declared `static`:
+A method signature is a contract: it declares what the method needs and
+what it returns. C# gives you fine-grained control over how arguments
+are passed, which shapes both performance and correctness.
 
 ```csharp
-public static IEnumerable<int> Fibonacci(int count)
+// The anatomy of a method signature
+public static async Task<IReadOnlyList<Order>> GetActiveOrdersAsync(
+    string customerId,          // required value parameter
+    int    pageSize   = 20,     // optional: caller can omit, gets 20
+    int    page       = 0,      // optional
+    CancellationToken ct = default  // conventional last param for async
+)
 {
-    return Generate();
+    // ...
+}
 
-    // Local function — visible within the enclosing method
-    IEnumerable<int> Generate()
+// Callers can use named arguments — order does not matter with named
+var orders = await GetActiveOrdersAsync(
+    customerId: "C001",
+    page: 2,
+    pageSize: 10);
+```
+
+### Value vs. Reference Parameters — `ref`, `out`, `in`
+
+By default, parameters are passed by value: a copy is made. For
+reference types that copy is cheap (it is just a pointer). For large
+value types, passing by value copies the whole struct.
+
+```csharp
+// ref: pass by reference — caller's variable is modified
+void Increment(ref int value) => value++;
+int n = 5;
+Increment(ref n);
+Console.WriteLine(n); // 6 — the original was modified
+
+// out: like ref but the method MUST assign it before returning
+// Useful for Try* patterns
+bool TryParse(string input, out int result)
+{
+    return int.TryParse(input, out result);
+}
+if (TryParse("42", out int n2))
+    Console.WriteLine(n2);
+
+// in: pass by reference but READONLY — prevents copy of large structs
+// without allowing modification
+void PrintMatrix(in Matrix4x4 m)   // 64-byte struct, passed without copying
+{
+    Console.WriteLine(m.M11);      // read-only access
+    // m.M11 = 0;                  // COMPILE ERROR — in is readonly
+}
+```
+
+### `params` — Variable Number of Arguments
+
+```csharp
+// params lets callers pass any number of arguments as if they were an array
+int Sum(params int[] numbers) => numbers.Sum();
+
+Sum(1, 2, 3);           // three arguments
+Sum(1, 2, 3, 4, 5);    // five arguments
+Sum();                   // zero arguments
+Sum(new[] { 1, 2, 3 }); // explicit array
+```
+
+### Local Functions — Functions Inside Functions
+
+A local function is defined inside another method and can only be called
+from within it. Unlike lambdas, local functions can be recursive, can
+have `yield return`, and do not allocate a closure object if they
+do not capture any outer variables.
+
+```csharp
+public IEnumerable<int> GetPrimes(int limit)
+{
+    for (int i = 2; i <= limit; i++)
+        if (IsPrime(i)) yield return i;
+
+    // Local function: only visible inside GetPrimes
+    static bool IsPrime(int n)   // 'static' prevents accidental capture of outer variables
     {
-        int a = 0, b = 1;
-        for (int i = 0; i < count; i++)
-        {
-            yield return a;
-            (a, b) = (b, a + b);
-        }
+        if (n < 2) return false;
+        for (int k = 2; k * k <= n; k++)
+            if (n % k == 0) return false;
+        return true;
     }
 }
-
-// Static local function — cannot capture (prevents accidental closure)
-public double Calculate(double x)
-{
-    return Transform(Normalize(x));
-
-    static double Normalize(double v) => (v - 0) / (100 - 0);
-    static double Transform(double v) => Math.Sqrt(v);
-}
-
-// Local functions for recursive lambdas (lambdas can't be self-referencing)
-public static int Factorial(int n)
-{
-    return Calc(n);
-
-    static int Calc(int n) => n <= 1 ? 1 : n * Calc(n - 1);
-}
 ```
 
 ---
 
-## 4.3 Extension Methods
+## 4.2 Extension Methods — Adding Behaviour to Types You Don't Own
+
+An extension method appears to be a member of a type but is defined
+externally in a static class. The compiler rewrites `value.Method()` to
+`StaticClass.Method(value)` — it is purely a call-site convenience.
+
+Extension methods are how LINQ (`Where`, `Select`, `OrderBy`) is added
+to every `IEnumerable<T>` without modifying any collection class. They
+are also how you add utility methods to BCL types like `string`, `int`,
+or `IServiceCollection` (the pattern used throughout ASP.NET Core DI).
 
 ```csharp
-// Must be in a static class, first param is `this T`
+// Define: first parameter is the type being extended, marked with 'this'
 public static class StringExtensions
 {
-    public static bool IsNullOrWhiteSpace(this string? s)
-        => string.IsNullOrWhiteSpace(s);
+    // Adds .Truncate() to all string values
+    public static string Truncate(this string value, int maxLength)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        return value.Length <= maxLength
+            ? value
+            : value[..maxLength] + "…";
+    }
 
-    public static string Truncate(this string s, int maxLen, string suffix = "…")
-        => s.Length <= maxLen ? s : s[..maxLen] + suffix;
-
-    public static T? ParseEnum<T>(this string s) where T : struct, Enum
-        => Enum.TryParse<T>(s, ignoreCase: true, out var v) ? v : null;
-
-    public static IEnumerable<T> WhereNotNull<T>(this IEnumerable<T?> source) where T : class
-        => source.Where(x => x is not null)!;
+    // Adds .IsNullOrEmpty() to all string? values
+    public static bool IsNullOrEmpty(this string? value) =>
+        string.IsNullOrEmpty(value);
 }
 
-// Extension on interfaces — adds methods to all implementors
-public static class EnumerableExtensions
+// Usage: looks like a string method
+string title = "The Quick Brown Fox Jumped Over The Lazy Dog";
+Console.WriteLine(title.Truncate(15)); // "The Quick Brown…"
+```
+
+```csharp
+// The canonical pattern: extension method on IServiceCollection for DI registration
+// This is how the ASP.NET Core ecosystem works — every library adds itself this way
+public static IServiceCollection AddEmailService(
+    this IServiceCollection services, Action<EmailOptions> configure)
 {
-    public static IEnumerable<T> Shuffle<T>(this IEnumerable<T> source, Random? rng = null)
-    {
-        rng ??= Random.Shared;
-        var arr = source.ToArray();
-        for (int i = arr.Length - 1; i > 0; i--)
-        {
-            int j = rng.Next(i + 1);
-            (arr[i], arr[j]) = (arr[j], arr[i]);
-        }
-        return arr;
-    }
-
-    public static async Task<List<T>> ToListAsync<T>(this IAsyncEnumerable<T> source,
-        CancellationToken ct = default)
-    {
-        var list = new List<T>();
-        await foreach (var item in source.WithCancellation(ct))
-            list.Add(item);
-        return list;
-    }
+    services.Configure(configure);
+    services.AddScoped<IEmailSender, SmtpEmailSender>();
+    return services;
 }
+
+// In Program.cs:
+builder.Services.AddEmailService(opts =>
+{
+    opts.Host = "smtp.example.com";
+    opts.Port = 587;
+});
 ```
 
 ---
 
-## 4.4 Delegates
+## 4.3 Delegates — Variables That Hold Functions
 
-A delegate is a type-safe function pointer.
+A delegate is a type that represents a reference to a method. It is a
+first-class citizen — you can store a method in a variable, pass it as
+an argument, return it from a method, and call it later. This is the
+foundation for callbacks, event handling, LINQ, and async continuations.
+
+Before understanding `Func` and `Action` (the modern way), understand
+what delegates fundamentally are:
 
 ```csharp
-// Declare delegate type
-public delegate int Transformer(int input);
+// Declare a delegate type: a type signature for methods
+delegate int Transform(int input);
 
-// Assign method
-Transformer square = x => x * x;
-Transformer negate = x => -x;
+// Any method with signature int(int) is compatible
+int Double(int x) => x * 2;
+int Square(int x) => x * x;
 
-// Compose
-Transformer squareThenNegate = x => negate(square(x));
-Console.WriteLine(squareThenNegate(5)); // -25
+// Assign a method to a delegate variable
+Transform op = Double;
+Console.WriteLine(op(5));  // 10
 
-// Multicast delegate (+=)
-Action<string> log = Console.WriteLine;
-log += s => Debug.WriteLine(s);
-log += WriteToFile;  // called in order: Console, Debug, file
-log("hello");
-log -= WriteToFile;  // remove handler
+op = Square;               // point to a different method
+Console.WriteLine(op(5));  // 25
 ```
 
-### Built-In Delegate Types
+### `Func` and `Action` — The Standard Delegate Types
+
+Writing a custom delegate type for every use case is tedious. The BCL
+provides generic delegate types that cover all common cases:
 
 ```csharp
-// Action — void return, 0-16 type params
-Action doSomething = () => Console.WriteLine("hi");
-Action<int> printInt = n => Console.WriteLine(n);
-Action<string, int> printBoth = (s, n) => Console.WriteLine($"{s}={n}");
+// Func<T1, ..., TResult> — a function that returns a value
+Func<int, int>     doubler   = x => x * 2;
+Func<string, bool> notEmpty  = s => !string.IsNullOrEmpty(s);
+Func<int, int, int> add      = (a, b) => a + b;
 
-// Func — non-void return, 0-16 input params + 1 return
-Func<int> getZero = () => 0;
-Func<int, int> square = x => x * x;
-Func<int, int, int> add = (a, b) => a + b;
-Func<string, bool> isLong = s => s.Length > 10;
+// Action<T1, ...> — a function that returns void (performs a side effect)
+Action<string>        log     = Console.WriteLine;
+Action<string, int>   repeat  = (s, n) => { for(int i=0;i<n;i++) Console.Write(s); };
 
-// Predicate<T> — shorthand for Func<T, bool>
-Predicate<int> isEven = n => n % 2 == 0;
+// Predicate<T> — specifically a Func<T, bool> (common in older APIs)
+Predicate<int>  isEven = n => n % 2 == 0;
+```
 
-// Comparison<T> — shorthand for Func<T, T, int>
-Comparison<string> byLength = (a, b) => a.Length.CompareTo(b.Length);
-var sorted = words.OrderBy(x => x.Length).ToList();
+Passing `Func` and `Action` as parameters is how you write behaviour-
+parameterised methods — methods that can be customised by the caller:
 
-// EventHandler<TEventArgs>
-EventHandler<OrderPlacedEventArgs> handler = (sender, e) => Console.WriteLine(e.OrderId);
+```csharp
+// Higher-order function: takes a function as a parameter
+public List<TResult> Transform<T, TResult>(List<T> items, Func<T, TResult> selector)
+{
+    var result = new List<TResult>(items.Count);
+    foreach (var item in items)
+        result.Add(selector(item));
+    return result;
+}
+
+var names = new List<string> { "alice", "bob", "charlie" };
+var upper = Transform(names, s => s.ToUpper());  // passed a lambda
 ```
 
 ---
 
-## 4.5 Lambdas & Closures
+## 4.4 Lambdas and Closures — Functions Defined Inline
+
+A lambda expression is an anonymous function defined inline. It uses
+the `=>` (arrow) syntax: `parameters => body`. Lambdas are the most
+common way to provide a `Func` or `Action` argument.
 
 ```csharp
-// Lambda forms
-Func<int, int> f1 = x => x * x;            // expression lambda
-Func<int, int> f2 = (int x) => x * x;     // typed param
-Func<int, int> f3 = x => { return x * x; }; // statement lambda
-Func<int, int, int> f4 = (x, y) => x + y;
+// Various lambda syntaxes
+Func<int, int> square = x => x * x;           // expression body, one parameter
+Func<int, int, int> add = (a, b) => a + b;    // two parameters
+Action greet = () => Console.WriteLine("Hi"); // no parameters
+Func<int, bool> check = x =>
+{
+    if (x < 0) return false;
+    return x % 2 == 0;
+};  // block body for complex logic
+```
 
-// Discard unused params
-Action<int, int> onlyFirst = (x, _) => Console.WriteLine(x);
+### Closures — Capturing Variables From Outer Scope
 
-// Closures capture outer variables by reference
+A closure is a lambda that *captures* a variable from the enclosing
+scope. The lambda carries a reference to the captured variable, not a
+copy. This means the lambda can read and modify the outer variable, and
+changes to the outer variable are visible in the lambda.
+
+```csharp
 int multiplier = 3;
-Func<int, int> multiply = x => x * multiplier;
-multiplier = 10;
-Console.WriteLine(multiply(5)); // 50 — captures the variable, not the value!
+Func<int, int> triple = x => x * multiplier;  // captures 'multiplier'
 
-// Capture with caution in loops
-var fns = new List<Func<int>>();
-for (int i = 0; i < 3; i++)
-{
-    int captured = i;  // capture copy to avoid closure bug
-    fns.Add(() => captured);
-}
-// Without int captured = i: all fns would return 3
+Console.WriteLine(triple(5));  // 15
 
-// Static lambdas (C# 9+) — cannot capture, guaranteed no allocation
-Func<int, int> staticSquare = static x => x * x;
+multiplier = 10;               // change the captured variable
+Console.WriteLine(triple(5));  // 50 — the lambda sees the CURRENT value of multiplier
 ```
 
-### Lambda Attributes (C# 10+)
+This behaviour is often surprising. The most common trap is capturing a
+loop variable:
 
 ```csharp
-// Apply attributes to lambdas
-var validate = [DebuggerStepThrough] (string? s) => !string.IsNullOrEmpty(s);
+// BUG: all lambdas capture the SAME variable 'i'
+var actions = new List<Action>();
+for (int i = 0; i < 5; i++)
+    actions.Add(() => Console.WriteLine(i));
+
+actions.ForEach(a => a());
+// Prints: 5 5 5 5 5  (not 0 1 2 3 4)
+// Because by the time the lambdas run, 'i' is 5
+
+// FIX: capture a copy
+for (int i = 0; i < 5; i++)
+{
+    int captured = i;   // new variable per iteration
+    actions.Add(() => Console.WriteLine(captured));
+}
+actions.ForEach(a => a());
+// Prints: 0 1 2 3 4
+```
+
+Note: `foreach` (unlike `for`) creates a new scope per iteration in
+modern C#, so `foreach (var item in list)` does not have this problem.
+
+---
+
+## 4.5 Events — The Delegate-Based Notification Pattern
+
+An event is a restricted delegate: callers can subscribe (`+=`) and
+unsubscribe (`-=`) but cannot invoke it or replace it. This is the
+Observer pattern (see Ch 29 §29.5) baked into the language.
+
+Events are used throughout the BCL: `Button.Click`, `Timer.Elapsed`,
+`FileSystemWatcher.Changed`, `HttpClient.SendAsync` progress callbacks.
+
+```csharp
+// Define an event in a class
+public class OrderProcessor
+{
+    // EventHandler<T> is the standard delegate type for events
+    // T = event args type carrying event data
+    public event EventHandler<OrderProcessedEventArgs>? OrderProcessed;
+
+    public async Task ProcessAsync(Order order, CancellationToken ct)
+    {
+        // ... process the order ...
+
+        // Raise the event — notify all subscribers
+        // The ?. is critical: if no one has subscribed, OrderProcessed is null
+        OrderProcessed?.Invoke(this, new OrderProcessedEventArgs(order.Id, order.Total));
+    }
+}
+
+public record OrderProcessedEventArgs(Guid OrderId, decimal Total) : EventArgs;
+
+// Subscribe (register a handler)
+var processor = new OrderProcessor();
+processor.OrderProcessed += (sender, args) =>
+    Console.WriteLine($"Order {args.OrderId} processed: {args.Total:C}");
+
+// Unsubscribe to prevent memory leaks
+// If the subscriber lives longer than the publisher, the event holds a reference
+// to the subscriber, preventing GC. Always unsubscribe when done.
+processor.OrderProcessed -= handler;
 ```
 
 ---
 
-## 4.6 Events
+## 4.6 Functional Patterns — Pure Functions, Immutability, and Composition
+
+Functional programming is not a separate paradigm — it is a set of
+techniques you can apply in C# to write more predictable, testable code.
+
+### Pure Functions — No Side Effects
+
+A pure function always returns the same output for the same input and
+has no observable side effects (no mutation of external state, no I/O).
+Pure functions are trivially testable, parallelisable, and cacheable.
 
 ```csharp
-// Define event args
-public class OrderPlacedEventArgs : EventArgs
+// Pure: depends only on its input, changes nothing external
+public static decimal ApplyDiscount(decimal price, decimal discountPercent) =>
+    price * (1 - discountPercent / 100);
+
+// Impure: reads from external state, has side effects
+public decimal ApplyDiscount(decimal price)
 {
-    public string OrderId { get; }
-    public decimal Total { get; }
-    public OrderPlacedEventArgs(string orderId, decimal total)
+    var discount = _database.GetCurrentDiscount();  // reads external state
+    _auditLog.RecordDiscount(price, discount);       // side effect
+    return price * (1 - discount / 100);
+}
+```
+
+### Function Composition
+
+Building complex behaviour by combining simple functions:
+
+```csharp
+// A pipeline of transformations
+var result = prices
+    .Where(p => p > 0)               // filter
+    .Select(p => p * 1.19m)          // transform (apply VAT)
+    .Select(p => Math.Round(p, 2))   // transform (round)
+    .OrderByDescending(p => p)       // sort
+    .Take(10)                        // limit
+    .ToList();                       // materialise
+```
+
+Each function in the chain is a pure transformation. The chain is easy
+to read, test each step independently, and modify without touching other
+steps. This is the foundation of LINQ (Chapter 7).
+
+### Method Chaining and Fluent APIs
+
+The pattern where every method returns `this` (or a new instance), enabling chains:
+
+```csharp
+// Building objects fluently
+var config = new EmailConfiguration()
+    .WithHost("smtp.example.com")
+    .WithPort(587)
+    .WithCredentials("user", "pass")
+    .WithTls(true);
+```
+
+```csharp
+// Implementation
+public class EmailConfiguration
+{
+    private string _host = "";
+    private int _port = 25;
+
+    public EmailConfiguration WithHost(string host)
     {
-        OrderId = orderId;
-        Total = total;
+        _host = host;
+        return this;   // return this for chaining
     }
-}
-
-// Publisher
-public class OrderService
-{
-    // Event using EventHandler<T>
-    public event EventHandler<OrderPlacedEventArgs>? OrderPlaced;
-
-    protected virtual void OnOrderPlaced(OrderPlacedEventArgs e)
-        => OrderPlaced?.Invoke(this, e);  // thread-safe null check with ?.
-
-    public void PlaceOrder(string id, decimal total)
+    public EmailConfiguration WithPort(int port)
     {
-        // ... business logic ...
-        OnOrderPlaced(new OrderPlacedEventArgs(id, total));
+        _port = port;
+        return this;
     }
-}
-
-// Subscriber
-var svc = new OrderService();
-svc.OrderPlaced += (sender, e) =>
-    Console.WriteLine($"Order {e.OrderId} placed: {e.Total:C}");
-
-svc.OrderPlaced += async (sender, e) =>
-{
-    await SendEmailAsync(e.OrderId);
-};
-
-svc.PlaceOrder("ORD-001", 99.99m);
-
-// Custom event accessors
-private EventHandler<OrderPlacedEventArgs>? _orderPlaced;
-public event EventHandler<OrderPlacedEventArgs>? OrderPlaced
-{
-    add    => _orderPlaced += value;
-    remove => _orderPlaced -= value;
-}
-```
-
----
-
-## 4.7 Functional Patterns in C#
-
-### Higher-Order Functions
-
-```csharp
-// Function that takes functions
-public static IEnumerable<TResult> Map<T, TResult>(
-    IEnumerable<T> source,
-    Func<T, TResult> f)
-    => source.Select(f);
-
-// Function that returns functions
-public static Func<T, bool> Not<T>(Func<T, bool> predicate)
-    => x => !predicate(x);
-
-public static Func<T, TResult> Memoize<T, TResult>(Func<T, TResult> f)
-    where T : notnull
-{
-    var cache = new Dictionary<T, TResult>();
-    return x =>
-    {
-        if (!cache.TryGetValue(x, out var result))
-        {
-            result = f(x);
-            cache[x] = result;
-        }
-        return result;
-    };
-}
-
-// Usage
-var isNotEmpty = Not<string>(string.IsNullOrEmpty);
-var cachedFib = Memoize<int, long>(n => n <= 1 ? n : Fibonacci(n - 1) + Fibonacci(n - 2));
-```
-
-### Currying & Partial Application
-
-```csharp
-// Currying — transform (A, B) -> C into A -> B -> C
-public static Func<B, C> Curry<A, B, C>(Func<A, B, C> f, A a)
-    => b => f(a, b);
-
-Func<int, int, int> add = (a, b) => a + b;
-Func<int, int> add5 = Curry(add, 5);
-Console.WriteLine(add5(3));  // 8
-
-// Partial application
-Func<string, string, string> concat = (prefix, s) => prefix + s;
-Func<string, string> addPrefix = s => concat("LOG: ", s);
-```
-
-### Pipeline / Method Chaining
-
-```csharp
-// Fluent builder pattern
-public class QueryBuilder
-{
-    private string _table = "";
-    private readonly List<string> _conditions = new();
-    private int? _limit;
-    private string? _orderBy;
-
-    public QueryBuilder From(string table) { _table = table; return this; }
-    public QueryBuilder Where(string condition) { _conditions.Add(condition); return this; }
-    public QueryBuilder Limit(int n) { _limit = n; return this; }
-    public QueryBuilder OrderBy(string col) { _orderBy = col; return this; }
-
-    public string Build()
-    {
-        var sql = $"SELECT * FROM {_table}";
-        if (_conditions.Any()) sql += " WHERE " + string.Join(" AND ", _conditions);
-        if (_orderBy is not null) sql += $" ORDER BY {_orderBy}";
-        if (_limit.HasValue) sql += $" LIMIT {_limit}";
-        return sql;
-    }
-}
-
-// Usage
-var query = new QueryBuilder()
-    .From("users")
-    .Where("age > 18")
-    .Where("active = 1")
-    .OrderBy("name")
-    .Limit(50)
-    .Build();
-```
-
-### Option / Maybe Pattern
-
-```csharp
-// Custom Option<T> for explicit maybe semantics
-public readonly struct Option<T>
-{
-    private readonly T _value;
-    public bool HasValue { get; }
-
-    private Option(T value) { _value = value; HasValue = true; }
-
-    public static Option<T> Some(T value) => new(value);
-    public static Option<T> None()        => default;
-
-    public T GetOrThrow() => HasValue ? _value : throw new InvalidOperationException("No value.");
-    public T GetOrDefault(T def) => HasValue ? _value : def;
-
-    public Option<TOut> Map<TOut>(Func<T, TOut> f)
-        => HasValue ? Option<TOut>.Some(f(_value)) : Option<TOut>.None();
-
-    public Option<TOut> Bind<TOut>(Func<T, Option<TOut>> f)
-        => HasValue ? f(_value) : Option<TOut>.None();
-
-    public void Match(Action<T> some, Action none)
-    {
-        if (HasValue) some(_value); else none();
-    }
-
-    public TOut Match<TOut>(Func<T, TOut> some, Func<TOut> none)
-        => HasValue ? some(_value) : none();
-}
-
-static class Option
-{
-    public static Option<T> Some<T>(T value) => Option<T>.Some(value);
-    public static Option<T> None<T>() => Option<T>.None();
-}
-
-// Usage
-Option<User> FindUser(int id) =>
-    _db.TryGetValue(id, out var u) ? Option.Some(u) : Option.None<User>();
-
-var name = FindUser(42)
-    .Map(u => u.Name)
-    .GetOrDefault("Unknown");
-```
-
----
-
-## 4.8 Expression Trees
-
-Expression trees represent code as data — used by LINQ-to-SQL, ORMs, mocking frameworks.
-
-```csharp
-using System.Linq.Expressions;
-
-// Compile-time expression tree
-Expression<Func<int, int>> squareExpr = x => x * x;
-
-// Inspect the tree
-var body = (BinaryExpression)squareExpr.Body;
-Console.WriteLine(body.NodeType);   // Multiply
-Console.WriteLine(body.Left);       // x
-Console.WriteLine(body.Right);      // x
-
-// Compile and invoke
-var square = squareExpr.Compile();
-Console.WriteLine(square(5));       // 25
-
-// Build at runtime
-var param = Expression.Parameter(typeof(int), "x");
-var mul   = Expression.Multiply(param, param);
-var lambda = Expression.Lambda<Func<int, int>>(mul, param);
-var fn = lambda.Compile();
-Console.WriteLine(fn(7));           // 49
-
-// Real use: EF Core strongly-typed filter
-IQueryable<User> FilterBy<T>(IQueryable<User> q, Expression<Func<User, T>> selector, T value)
-{
-    // This translates to SQL — lambda expressions, not delegates!
-    var param = selector.Parameters[0];
-    var eq = Expression.Equal(selector.Body, Expression.Constant(value));
-    var predicate = Expression.Lambda<Func<User, bool>>(eq, param);
-    return q.Where(predicate);
+    // ...
 }
 ```
 
 ---
 
-## 4.9 Operator Overloading
+## 4.7 Expression Trees — Functions as Data
+
+A lambda can be compiled as a delegate (executable code) or as an
+*expression tree* (a data structure describing the code). Expression
+trees are what allow LINQ-to-SQL to work: the `x => x.Age > 18` lambda
+is not executed in .NET — it is inspected, translated to SQL, and the
+SQL is executed by the database.
 
 ```csharp
-public readonly record struct Money(decimal Amount, string Currency)
+// Compiled delegate — executes in .NET
+Func<int, bool> filter = x => x > 5;
+bool result = filter(10); // executes immediately
+
+// Expression tree — represents the code as data
+Expression<Func<int, bool>> expr = x => x > 5;
+// expr is not a function — it is a tree of nodes:
+// BinaryExpression(Parameter("x"), Constant(5), GreaterThan)
+
+// EF Core uses this to translate to SQL
+db.Orders.Where(o => o.Total > 100m)  // IQueryable — expression tree passed to EF
+         .ToListAsync();               // EF translates the expression to SQL WHERE
+```
+
+You rarely write expression tree manipulation directly, but understanding
+that `IQueryable<T>` operates on expression trees (not executed code)
+explains why you must not call arbitrary methods inside a LINQ-to-EF
+query — the database cannot execute C# methods. Chapter 15 §15.12 covers
+this thoroughly.
+
+---
+
+## 4.8 Operator Overloading — Make Your Types Feel Native
+
+Operators can be defined for your custom types, making them integrate
+naturally with the language. This is appropriate for types that
+represent a mathematical or domain concept:
+
+```csharp
+public readonly struct Money(decimal amount, string currency)
 {
+    public decimal Amount   { get; } = amount;
+    public string  Currency { get; } = currency;
+
     public static Money operator +(Money a, Money b)
     {
         if (a.Currency != b.Currency)
-            throw new InvalidOperationException($"Cannot add {a.Currency} and {b.Currency}");
-        return new(a.Amount + b.Amount, a.Currency);
+            throw new InvalidOperationException($"Currency mismatch: {a.Currency} vs {b.Currency}");
+        return new Money(a.Amount + b.Amount, a.Currency);
     }
 
-    public static Money operator -(Money a, Money b)
-    {
-        if (a.Currency != b.Currency)
-            throw new InvalidOperationException("Currency mismatch");
-        return new(a.Amount - b.Amount, a.Currency);
-    }
+    public static Money operator *(Money m, decimal factor) =>
+        new Money(m.Amount * factor, m.Currency);
 
-    public static Money operator *(Money m, decimal factor) => new(m.Amount * factor, m.Currency);
-    public static Money operator *(decimal factor, Money m) => m * factor;
+    public static bool operator ==(Money a, Money b) =>
+        a.Amount == b.Amount && a.Currency == b.Currency;
 
-    public static bool operator >(Money a, Money b)  => a.Amount > b.Amount;
-    public static bool operator <(Money a, Money b)  => a.Amount < b.Amount;
-    public static bool operator >=(Money a, Money b) => a.Amount >= b.Amount;
-    public static bool operator <=(Money a, Money b) => a.Amount <= b.Amount;
-
-    // Implicit/explicit conversions
-    public static explicit operator decimal(Money m) => m.Amount;
-    public static implicit operator string(Money m)  => m.ToString();
+    public static bool operator !=(Money a, Money b) => !(a == b);
 
     public override string ToString() => $"{Amount:F2} {Currency}";
 }
 
-// Usage
+// Now Money reads like a number
 var price = new Money(9.99m, "EUR");
-var tax   = new Money(1.90m, "EUR");
-var total = price + tax;                    // 11.89 EUR
-var doubled = total * 2;                    // 23.78 EUR
-bool expensive = total > new Money(10m, "EUR"); // true
+var tax   = new Money(0.85m, "EUR");
+var total = price + tax;         // Money.operator+
+var discounted = total * 0.9m;   // Money.operator*
+Console.WriteLine(discounted);   // 9.76 EUR
 ```
 
-> **Rider tip:** *Alt+Enter* on a lambda expression offers *"Convert to method group"* when applicable (e.g., `x => x.ToString()` → `Convert.ToString`). Also use *Refactor → Extract Method* (`Ctrl+Alt+M` / `⌘⌥M`) to extract a lambda into a named local function or method.
+---
 
-> **VS tip:** *Ctrl+.* on a complex delegate expression offers *"Introduce local variable"* or *"Convert to method"*. Use *Quick Actions* to convert between lambda forms.
+## 4.9 Connecting Methods and Functions to the Rest of the Book
 
+- **Ch 7 (LINQ)** — every LINQ operator (`Where`, `Select`, `GroupBy`)
+  takes `Func<T, TResult>` arguments. Understanding lambdas and closures
+  is prerequisite for understanding why LINQ behaves the way it does.
+- **Ch 8 (Async)** — `async` methods return `Task<T>`, which is itself
+  an object holding a continuation (a delegate). The `await` operator
+  registers a callback on that continuation.
+- **Ch 5 (OOP)** — interfaces define the *signatures* of methods. The
+  relationship between a delegate (`Func<IFoo, IBar>`) and an interface
+  method (`IFoo.GetBar()`) is deep.
+- **Ch 10–11 (DI)** — factory delegates (`Func<IServiceProvider, T>`)
+  are a common DI pattern. Extension methods on `IServiceCollection` are
+  the primary DI registration mechanism.
+- **Ch 29 (Design Patterns)** — Strategy, Observer, and Decorator all
+  fundamentally use delegates or interfaces to represent replaceable
+  behaviour.

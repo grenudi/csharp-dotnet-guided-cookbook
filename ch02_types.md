@@ -1,892 +1,728 @@
 # Chapter 2 — Types: Value, Reference, Nullable, Records, Structs
 
-## 2.1 The Type System at a Glance
+> C# is a statically typed language. Every variable, parameter, field,
+> and return value has a type known at compile time. The type system is
+> not bureaucracy — it is a machine that catches entire categories of
+> bugs before your program ever runs. This chapter explains the type
+> system from the ground up: what the two fundamental categories are,
+> why they behave differently, and the modern C# features built on top
+> of them. Everything in later chapters — collections, async, DI, EF
+> Core — is built from these types.
 
-```
-System.Object
-├── Value types (sealed, stored inline on stack or in-line in containing type)
-│   ├── Primitives: bool, byte, sbyte, short, ushort, int, uint,
-│   │               long, ulong, float, double, decimal, char
-│   ├── Structs: DateTime, Guid, TimeSpan, Point, custom structs
-│   └── Enums: enum Color { Red, Green, Blue }
-│
-└── Reference types (heap-allocated, reference stored)
-    ├── class, interface, delegate, array
-    └── record class (reference semantic records)
-```
+---
 
-### Value vs. Reference — Implications
+## 2.1 The Two Fundamental Categories: Value Types and Reference Types
+
+Every type in C# is either a value type or a reference type. This is
+the most important distinction in the type system and affects how memory
+is allocated, how assignment works, and how equality is defined.
+
+### Value Types — Copy Semantics
+
+A value type stores its data *directly* in the variable. When you assign
+a value type to another variable, the data is copied. The two variables
+are independent — changing one does not change the other.
+
+Value types are either stored on the stack (when they are local
+variables or method parameters) or *inline* inside the containing object
+on the heap (when they are fields of a class). There is no separate heap
+allocation for a value type. This is why they are fast to create and
+require no garbage collection.
 
 ```csharp
-// Value type: copy semantics
 int a = 42;
-int b = a;     // b is a copy
+int b = a;    // b receives a COPY of 42
 b = 100;
-Console.WriteLine(a); // 42 — unchanged
+Console.WriteLine(a); // 42 — a was not changed
+```
 
-// Reference type: reference semantics
+Built-in value types: `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`,
+`uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`. User-
+defined value types are `struct` and `enum`.
+
+### Reference Types — Reference Semantics
+
+A reference type stores a *reference* (essentially a pointer) in the
+variable. The actual data lives on the heap. When you assign a reference
+type to another variable, you copy the reference — both variables now
+point to the same object on the heap. Changing the object through one
+variable changes it for all variables that reference the same object.
+
+```csharp
 var list1 = new List<int> { 1, 2, 3 };
-var list2 = list1;   // both point to same object
+var list2 = list1;    // list2 holds a COPY of the reference
+                      // both point to the same List object on the heap
 list2.Add(4);
-Console.WriteLine(list1.Count); // 4 — changed!
+Console.WriteLine(list1.Count); // 4 — the shared object was modified
+```
 
-// Struct: copy semantics
-var p1 = new Point(1, 2);
-var p2 = p1;      // copy
-p2 = p2 with { X = 99 };   // record struct syntax
-Console.WriteLine(p1.X); // 1 — unchanged
+Built-in reference types: `class`, `interface`, `delegate`, `array`,
+`string`. User-defined reference types are `class` and `record class`.
+
+### Why This Distinction Matters in Practice
+
+Understanding this prevents three common bug categories:
+
+**Bug 1 — Accidental mutation through shared references:**
+```csharp
+// Passing a list to a method lets the method modify the ORIGINAL list
+void AddItem(List<string> items) => items.Add("extra");
+var myList = new List<string> { "one", "two" };
+AddItem(myList);
+Console.WriteLine(myList.Count); // 3 — the original was modified
+```
+
+**Bug 2 — Assuming two objects with the same data are equal:**
+```csharp
+var p1 = new Point { X = 1, Y = 2 };  // class (reference type)
+var p2 = new Point { X = 1, Y = 2 };
+Console.WriteLine(p1 == p2); // False — they are different objects
+                              // Records fix this: see §2.6
+```
+
+**Bug 3 — Expecting value-type fields to initialise independently:**
+```csharp
+// Structs are copied. Classes are referenced.
+DateTime[] schedule = new DateTime[5]; // DateTime is a value type
+schedule[0] = DateTime.Now;            // fine — direct access
+// All five slots are zero-initialised (DateTime.MinValue) independently
+```
+
+```
+The Type Hierarchy:
+
+System.Object
+├── Value types
+│   ├── Primitives: bool, byte, short, int, long, float, double, decimal, char
+│   ├── struct: DateTime, Guid, TimeSpan, Vector3, custom structs
+│   └── enum: Color, Status, Direction
+│
+└── Reference types
+    ├── class: string, List<T>, Dictionary<K,V>, custom classes
+    ├── interface: IDisposable, IEnumerable<T>
+    ├── delegate: Action, Func<T>, EventHandler
+    ├── array: int[], string[][]
+    └── record class: immutable data types (§2.6)
 ```
 
 ---
 
-## 2.2 Built-In Value Types
+## 2.2 Built-In Value Types — Choosing the Right One
 
-### Integer Types
+The choice of numeric type is not arbitrary. Using the wrong type wastes
+memory, causes overflow bugs, or introduces floating-point precision
+errors. Here is the practical guide.
+
+### Integer Types — Signed and Unsigned
 
 ```csharp
-// Signed
-sbyte sb = -128;          // 8-bit  [-128, 127]
-short s  = -32_768;       // 16-bit
-int   i  = 2_147_483_647; // 32-bit (most common)
-long  l  = 9_223_372_036_854_775_807L; // 64-bit
+// Signed integers — can hold negative values
+sbyte  value = -100;          // 8-bit  [-128, 127]          — rare, mainly for protocols
+short  small = -30_000;       // 16-bit [-32,768, 32,767]    — rare
+int    count = 2_000_000;     // 32-bit [-2.1B, 2.1B]        — the default integer type
+long   big   = 9_000_000_000L;// 64-bit [-9.2E18, 9.2E18]   — for large IDs, timestamps
 
-// Unsigned
-byte   b  = 255;           // 8-bit  [0, 255]
-ushort us = 65_535;        // 16-bit
-uint   ui = 4_294_967_295U;// 32-bit
-ulong  ul = 18_446_744_073_709_551_615UL; // 64-bit
+// Unsigned integers — no negatives, doubles the positive range
+byte   b  = 200;              // 8-bit  [0, 255]             — common for binary data
+ushort us = 60_000;           // 16-bit [0, 65,535]          — port numbers
+uint   ui = 4_000_000_000U;   // 32-bit [0, 4.3B]
+ulong  ul = 18_000_000_000_000_000_000UL; // 64-bit [0, 1.8E19]
 
-// Architecture-dependent
-nint  ni  = nint.MaxValue;  // native int (IntPtr size)
-nuint nui = nuint.MaxValue;
-
-// Numeric literals
-int hex  = 0xFF_AC;         // hex with _ separator
-int bin  = 0b_1010_0011;    // binary literal
-long sci = 1_000_000L;
+// Architecture-dependent (pointer size: 32-bit on x86, 64-bit on x64)
+nint   ni  = 42;              // native int — for interop with native APIs
+nuint  nui = 42;
 ```
 
-### Floating Point
+The `_` separator in numeric literals is purely cosmetic — the compiler
+ignores it. Use it to make large numbers readable: `1_000_000` instead of
+`1000000`.
+
+Use `int` for general-purpose counting. Use `long` for IDs in databases
+where integer overflow is a real risk. Use `byte` for raw data, network
+protocols, and binary file parsing.
+
+### Floating-Point Types — When Precision Matters
 
 ```csharp
-float  f = 3.14f;          // 32-bit, ~7 digits precision
-double d = 3.141592653589793; // 64-bit, ~15-17 digits (default)
-decimal m = 3.14159265358979323846m; // 128-bit, 28-29 digits, no rounding errors
+float   f = 3.14f;            // 32-bit, ~7 significant digits
+double  d = 3.141592653589793;// 64-bit, ~15-17 digits — the default for science/math
+decimal m = 9.99m;            // 128-bit, 28-29 digits, BASE 10 arithmetic
 
-// Use decimal for money!
+// The critical rule: use decimal for money
 decimal price = 9.99m;
-decimal tax   = 0.19m;
-decimal total = price * (1 + tax); // 11.8881m — exact
+decimal tax   = 0.0875m;
+decimal total = price * (1 + tax);  // 10.867125m — mathematically exact
 
-// Special float/double values
-double nan  = double.NaN;
-double posInf = double.PositiveInfinity;
-double negInf = double.NegativeInfinity;
-Console.WriteLine(double.IsNaN(nan));           // True
-Console.WriteLine(double.IsInfinity(posInf));   // True
+// Never use float or double for money
+double wrong = 0.1 + 0.2;
+Console.WriteLine(wrong); // 0.30000000000000004 — floating-point rounding error
+decimal right = 0.1m + 0.2m;
+Console.WriteLine(right); // 0.3 — exact
 ```
 
-### Boolean and Char
+The reason `double` gets 0.3 wrong: `double` stores numbers in binary
+fractions. 0.1 has no exact binary representation (just like 1/3 has no
+exact decimal representation). `decimal` uses base-10 arithmetic, so
+0.1, 0.2, and 0.3 are representable exactly.
+
+### Boolean and Character
 
 ```csharp
-bool flag = true;
-bool computed = (5 > 3) && (2 != 3);
+bool isReady = true;
+bool computed = (age >= 18) && !isBlocked;  // &&, ||, ! are short-circuit operators
 
-char c = 'A';
-char unicode = '\u00E9';  // é
-char escaped = '\n';       // newline
-int codePoint = (int)c;   // 65
+char letter  = 'A';
+char unicode = '\u00E9';    // é — any Unicode code point
+char newline = '\n';        // escape sequences
+int  code    = (int)letter; // 65 — the Unicode code point
 ```
 
-### Checked Arithmetic
-
-```csharp
-// By default, overflow silently wraps
-int max = int.MaxValue;
-int overflow = max + 1;  // -2147483648 (wraps!)
-
-// checked throws OverflowException
-checked
-{
-    int safe = max + 1;  // throws!
-}
-
-int result = checked(max + 1); // inline checked
-
-// unchecked (explicit — overrides checked block)
-unchecked
-{
-    int wrapped = max + 1; // -2147483648
-}
-```
+`bool` values have only two states. Never use `int` as a boolean — the
+compiler cannot help you spot a bug where `1` is passed where `true` was
+expected. Strongly-typed is always better.
 
 ---
 
-## 2.3 Strings
+## 2.3 Strings — Reference Type With Value-Like Behaviour
 
-Strings are **immutable reference types** with **value equality**.
+`string` is a reference type (it lives on the heap) but it behaves like
+a value type in one important way: it is *immutable*. Once created, a
+string cannot change. Every operation that appears to modify a string
+actually creates a new one.
 
 ```csharp
-// Creation
-string s1 = "Hello";
-string s2 = "World";
-string s3 = s1 + ", " + s2 + "!";    // concatenation (allocates new string)
-
-// String interpolation (preferred)
-string name = "Alice";
-int age = 30;
-string greeting = $"Hello, {name}! You are {age} years old.";
-
-// Multi-line interpolation (C# 11+)
-string json = $"""
-    {{
-        "name": "{name}",
-        "age": {age}
-    }}
-    """;
-
-// Verbatim string (no escape processing)
-string path = @"C:\Users\Alice\Documents\file.txt";
-
-// Raw string literal (C# 11+) — no escaping needed
-string html = """
-    <div class="container">
-        <p>Hello, "World"!</p>
-    </div>
-    """;
-
-// String equality
-bool eq1 = s1 == "Hello";                         // true (value equality)
-bool eq2 = string.Equals(s1, "hello", StringComparison.OrdinalIgnoreCase); // true
-
-// String methods (immutable — all return new strings)
-string upper   = s1.ToUpperInvariant();
-string lower   = s1.ToLowerInvariant();
-string trimmed = "  hello  ".Trim();
-string[] parts = "a,b,c".Split(',');
-string joined  = string.Join(", ", parts);
-bool starts    = s1.StartsWith("He");
-bool contains  = s1.Contains("ell");
-int idx        = s1.IndexOf('l');
-string sub     = s1.Substring(1, 3);  // "ell"
-string sub2    = s1[1..4];            // "ell" (Range syntax)
-string replaced= s1.Replace("Hello", "Hi");
-
-// Span<char> for zero-allocation string work
-ReadOnlySpan<char> span = s1.AsSpan();
-ReadOnlySpan<char> slice = span[1..4]; // "ell" — no allocation
-
-// StringBuilder for many concatenations
-var sb = new System.Text.StringBuilder();
-for (int i = 0; i < 1000; i++)
-    sb.Append(i).Append(", ");
-string result = sb.ToString();
+string s1 = "hello";
+string s2 = s1.ToUpper();   // creates a new string "HELLO"
+                             // s1 is still "hello"
+Console.WriteLine(s1);      // hello
+Console.WriteLine(s2);      // HELLO
 ```
 
-### String Interning
+### String Equality — Reference Vs. Content
+
+Because strings are immutable, the runtime *interns* literal strings —
+two identical string literals may share the same memory. This means `==`
+on strings checks *content equality* by default (the `==` operator is
+overloaded), unlike most reference types where `==` checks reference
+equality.
 
 ```csharp
 string a = "hello";
 string b = "hello";
-Console.WriteLine(ReferenceEquals(a, b)); // true — interned!
+Console.WriteLine(a == b);              // True — content equality
+Console.WriteLine(object.ReferenceEquals(a, b)); // True — same interned instance
 
-string c = new string("hello".ToCharArray());
-Console.WriteLine(ReferenceEquals(a, c)); // false — not interned
-
-string d = string.Intern(c);
-Console.WriteLine(ReferenceEquals(a, d)); // true
+string c = new string("hello".ToCharArray()); // forces a new allocation
+Console.WriteLine(a == c);              // True  — still content equality
+Console.WriteLine(object.ReferenceEquals(a, c)); // False — different objects
 ```
 
----
+### String Concatenation and StringBuilder
 
-## 2.4 Nullable Value Types (`T?`)
-
-Every value type `T` can be made nullable as `T?` (which is `Nullable<T>`):
+Concatenation with `+` creates a new string for each operation. In a
+loop, this generates O(n²) allocations:
 
 ```csharp
-int?    n1 = null;
-double? n2 = 3.14;
-bool?   n3 = null;
+// Bad: O(n²) allocations for large n
+string result = "";
+for (int i = 0; i < 10_000; i++)
+    result += i.ToString();   // creates 10,000 intermediate strings
 
-// Checking
-bool hasValue = n1.HasValue;   // false
-int value = n1.Value;          // InvalidOperationException if null!
+// Good: StringBuilder uses a resizable buffer
+var sb = new System.Text.StringBuilder();
+for (int i = 0; i < 10_000; i++)
+    sb.Append(i);
+string result2 = sb.ToString();   // one final string
 
-// Safe access
-int safe = n1.GetValueOrDefault();     // 0
-int safe2 = n1.GetValueOrDefault(-1);  // -1
-int safe3 = n1 ?? -1;                  // -1 (null coalescing)
-
-// Pattern matching (preferred)
-if (n1 is int actual)
-{
-    Console.WriteLine(actual);
-}
-
-// Lifted operators
-int? a = 5;
-int? b = null;
-int? sum = a + b;    // null (null propagates)
-bool? gt = a > 3;    // true
-bool? lt = b < 10;   // null
-
-// Nullable boxing
-object boxed = n2;   // boxes as double, not Nullable<double>
-object boxedNull = (int?)null; // boxes as null
+// Even better for fixed formats: string interpolation (compiler-optimised)
+string name = "Alice";
+int age = 30;
+string msg = $"Name: {name}, Age: {age}";  // compiled efficiently
 ```
 
----
+### Raw String Literals (C# 11+)
 
-## 2.5 Nullable Reference Types (NRT) — C# 8+
-
-NRT is a **static analysis** feature — it doesn't change runtime behavior, but enables the compiler to warn about potential null dereferences.
-
-### Enabling NRT
-
-```xml
-<!-- In .csproj -->
-<Nullable>enable</Nullable>
-```
-
-Or per-file:
+Raw string literals start and end with three or more quote characters.
+They preserve whitespace and do not require escape sequences:
 
 ```csharp
-#nullable enable    // turn on for this file
-#nullable disable   // turn off
-#nullable restore   // restore to project default
-```
-
-### The Four States
-
-```csharp
-// 1. Non-nullable reference (should never be null)
-string name = "Alice";       // OK
-string name2 = null;         // ⚠ Warning: Converting null to non-nullable
-
-// 2. Nullable reference (may be null — must check before use)
-string? maybeNull = null;    // OK
-int len = maybeNull.Length;  // ⚠ Warning: Dereference of possibly null reference
-int len2 = maybeNull?.Length ?? 0; // OK
-
-// 3. Non-nullable out of flow (compiler tracks null state)
-string? text = null;
-if (SomeCondition()) text = "hello";
-// After loop: text might still be null — compiler warns if you dereference
-Console.WriteLine(text.Length); // ⚠ Warning
-
-// 4. Null-forgiving operator (!) — you know better than the compiler
-string? fromDb = GetFromDatabase();
-string definitely = fromDb!;  // suppresses warning — use sparingly
-```
-
-### Nullable Annotations and Attributes
-
-```csharp
-using System.Diagnostics.CodeAnalysis;
-
-// [MaybeNull] — return may be null even if type is non-nullable
-[return: MaybeNull]
-public T Find<T>(IEnumerable<T> source, Predicate<T> predicate) => ...;
-
-// [NotNull] — out param guaranteed non-null when method returns true
-public bool TryGetUser(int id, [NotNullWhen(true)] out User? user)
-{
-    user = _db.Find(id);
-    return user is not null;
-}
-
-// Usage:
-if (TryGetUser(42, out var user))
-{
-    Console.WriteLine(user.Name); // no warning — compiler knows user is not null
-}
-
-// [AllowNull] — non-nullable property accepts null setter
-private string _name = "";
-[AllowNull]
-public string Name
-{
-    get => _name;
-    set => _name = value ?? ""; // value may be null
-}
-
-// [DisallowNull] — nullable type must not receive null
-public void SetLabel([DisallowNull] string? label)
-{
-    ArgumentNullException.ThrowIfNull(label);
-    _label = label;
-}
-
-// [MemberNotNull] — method guarantees member is non-null after call
-[MemberNotNull(nameof(_connection))]
-private void InitConnection()
-{
-    _connection = new SqlConnection(_connectionString);
-}
-
-// [NotNullIfNotNull] — return non-null when param is non-null
-[return: NotNullIfNotNull(nameof(value))]
-public static string? Trim(string? value) => value?.Trim();
-```
-
-### Constructor & Initialization Patterns
-
-```csharp
-// Problem: required properties with NRT
-public class User
-{
-    // Option 1: required keyword (C# 11+)
-    public required string Name { get; init; }
-    public required string Email { get; init; }
-
-    // Option 2: constructor
-    public User(string name, string email)
+string json = """
     {
-        Name = name;
-        Email = email;
+        "name": "Alice",
+        "path": "C:\\Users\\Alice"
     }
-}
-
-// Usage with required:
-var user = new User { Name = "Alice", Email = "alice@example.com" };
-// Compiler error if Name or Email omitted.
-
-// Option 3: nullable with default
-public class Config
-{
-    public string? ConnectionString { get; set; }  // nullable, may not be set
-    public int Port { get; set; } = 5432;          // default value
-}
-```
-
-### Null Guards
-
-```csharp
-// ArgumentNullException.ThrowIfNull (NET 6+)
-void Process(string input)
-{
-    ArgumentNullException.ThrowIfNull(input);
-    // input is guaranteed non-null here
-}
-
-// ArgumentException.ThrowIfNullOrEmpty / ThrowIfNullOrWhiteSpace (NET 7+)
-void ProcessName(string name)
-{
-    ArgumentException.ThrowIfNullOrEmpty(name);
-    ArgumentException.ThrowIfNullOrWhiteSpace(name);
-}
-
-// Null coalescing assignment (C# 8+)
-string? cached = null;
-cached ??= ComputeExpensive(); // only compute if null
+    """;
+// No escape needed for backslashes or quotes inside
 ```
 
 ---
 
-## 2.6 Records
+## 2.4 Nullable Value Types (`T?`) — Making the Absence of a Value Explicit
 
-Records are **compiler-synthesized** immutable (or mutable) types with value-based equality.
+Before C# 2, if you had a database integer column that could be NULL,
+you had no good way to represent that in C#. Developers used sentinel
+values (`-1`, `0`, `int.MinValue`) as stand-ins for "no value", leading
+to bugs where a valid negative number was mistaken for "missing".
 
-### Record Class (reference type)
+`Nullable<T>` (written `T?` for any value type `T`) solves this. It is a
+struct that wraps a value type and adds a boolean `HasValue` flag. A
+`null` nullable means "this value is absent" — there is no ambiguity.
 
 ```csharp
-// Positional record — concise syntax
+int? age = null;         // no age provided yet
+age = 25;                // age is now 25
+
+// Check before using
+if (age.HasValue)
+    Console.WriteLine($"Age: {age.Value}");
+
+// Null-coalescing operator: provide a default if null
+int actualAge = age ?? 0;
+
+// Null-conditional: safe access without explicit null check
+int? length = name?.Length;  // null if name is null, length otherwise
+
+// Pattern matching (cleaner than HasValue)
+if (age is int a)
+    Console.WriteLine($"Age: {a}");
+```
+
+Nullable value types appear everywhere database values are mapped to C#:
+an `int?` maps to an SQL `INT NULL` column. An `DateTime?` maps to
+`DATETIME NULL`. Never use sentinel values for absent data.
+
+---
+
+## 2.5 Nullable Reference Types (NRT) — Eliminating the Billion-Dollar Mistake
+
+Tony Hoare, who invented null references, called it his "billion-dollar
+mistake". `NullReferenceException` is one of the most common runtime
+errors in C# — a crash that happens when you call a method on a
+reference that turned out to be `null` at runtime.
+
+Nullable Reference Types (C# 8+, enabled with `<Nullable>enable</Nullable>`)
+move null safety to compile time. The compiler analyses your code's null
+flows and warns you before the program ever runs.
+
+### The Mental Model: Annotations Carry Meaning
+
+With NRT enabled:
+- `string` means "this will never be null — I guarantee it"
+- `string?` means "this might be null — you must check before using it"
+
+Without NRT enabled, `string` is ambiguous — the compiler cannot tell
+you which variables are safe to dereference. With NRT, the annotation
+*is* the documentation, enforced by the compiler.
+
+```csharp
+// NRT enabled: <Nullable>enable</Nullable>
+
+string name = "Alice";    // guaranteed non-null
+string? title = null;     // explicitly nullable
+
+// The compiler prevents dereferencing possibly-null values:
+int len1 = name.Length;   // fine — name cannot be null
+int len2 = title.Length;  // ERROR: title might be null — CS8602
+
+// Fix: check first
+if (title is not null)
+    int len3 = title.Length;  // fine inside the null check
+
+// Or use null-coalescing
+int len4 = title?.Length ?? 0;
+```
+
+### The Three Operators for Working With Nullable References
+
+```csharp
+// ?. (null-conditional) — safe member access
+string? result = user?.Address?.City;  // null if user or Address is null
+
+// ?? (null-coalescing) — provide a default
+string display = result ?? "Unknown city";
+
+// ??= (null-coalescing assignment) — assign only if null
+user ??= new User();  // equivalent to: if (user is null) user = new User();
+```
+
+### Suppression and `!`
+
+The `!` (null-forgiving) operator tells the compiler "I know this looks
+nullable but trust me, it is not null here". Use it only when you have
+external knowledge the compiler cannot see:
+
+```csharp
+// Entity Framework navigation properties are set by EF, not the constructor
+public class Order
+{
+    public Customer Customer { get; set; } = null!;  // EF sets this before you use it
+}
+```
+
+The `= null!` pattern is the standard way to handle non-nullable required
+reference type properties in classes that are initialised by an external
+framework (EF Core, model binding, deserialisers). Do not use `!` to
+suppress genuine null warnings — fix the code instead.
+
+---
+
+## 2.6 Records — Immutable Data With Value Equality
+
+Regular classes have reference equality: two different instances with the
+same data are not considered equal unless you override `Equals` and
+`GetHashCode`. Writing this boilerplate is tedious, and missing it causes
+subtle bugs when records are used as dictionary keys or in `HashSet<T>`.
+
+Records (C# 9+) are types declared with `record` that automatically
+provide:
+- **Value equality**: two records with the same property values are equal
+- **`ToString()`**: a formatted representation showing all property values
+- **Non-destructive mutation** via `with` expressions
+- **Deconstruction** into tuples
+
+Records are the preferred type for data transfer objects, domain events,
+configuration objects, and any type whose identity is determined by its
+content rather than its object identity.
+
+```csharp
+// record class — reference type with value equality
+public record Person(string FirstName, string LastName, int Age);
+
+var alice1 = new Person("Alice", "Smith", 30);
+var alice2 = new Person("Alice", "Smith", 30);
+
+Console.WriteLine(alice1 == alice2);     // True — value equality (not reference!)
+Console.WriteLine(alice1.ToString());    // Person { FirstName = Alice, LastName = Smith, Age = 30 }
+
+// Non-destructive mutation: create a copy with one field changed
+var olderAlice = alice1 with { Age = 31 };
+Console.WriteLine(alice1.Age);           // 30 — original unchanged
+Console.WriteLine(olderAlice.Age);       // 31 — new record
+```
+
+### Positional vs. Nominal Records
+
+```csharp
+// Positional syntax (parameters → properties + constructor + deconstruct)
 public record Point(double X, double Y);
 
-// The compiler generates:
-// - Primary constructor: Point(double X, double Y)
-// - Properties: public double X { get; init; }  public double Y { get; init; }
-// - Equals/GetHashCode based on all properties
-// - ToString(): "Point { X = 1, Y = 2 }"
-// - Deconstruct: void Deconstruct(out double x, out double y)
-// - With-expression support (Clone + init)
-
-var p1 = new Point(1, 2);
-var p2 = new Point(1, 2);
-Console.WriteLine(p1 == p2);  // True (value equality!)
-Console.WriteLine(ReferenceEquals(p1, p2)); // False
-
-// With-expression (non-destructive mutation)
-var p3 = p1 with { X = 99 };
-Console.WriteLine(p1);  // Point { X = 1, Y = 2 }
-Console.WriteLine(p3);  // Point { X = 99, Y = 2 }
-
-// Deconstruction
-var (x, y) = p1;
-Console.WriteLine($"{x}, {y}");  // 1, 2
-```
-
-### Records with Additional Members
-
-```csharp
-public record Order(
-    Guid Id,
-    string CustomerId,
-    IReadOnlyList<OrderLine> Lines,
-    DateTime CreatedAt)
+// Nominal syntax — like a class, but with record benefits
+public record Address
 {
-    // Computed property (not part of equality)
-    public decimal Total => Lines.Sum(l => l.Price * l.Quantity);
-
-    // Custom validation in primary constructor body
-    public Order
-    {
-        ArgumentException.ThrowIfNullOrEmpty(CustomerId);
-        if (Lines.Count == 0) throw new ArgumentException("Order must have lines.");
-        // Properties are already set at this point
-    }
-
-    // Additional constructor
-    public Order(string customerId, IReadOnlyList<OrderLine> lines)
-        : this(Guid.NewGuid(), customerId, lines, DateTime.UtcNow) { }
-}
-
-public record OrderLine(string Sku, int Quantity, decimal Price);
-```
-
-### Record Struct
-
-```csharp
-// record struct = value type + record features
-public record struct Vector3(float X, float Y, float Z);
-
-var v1 = new Vector3(1, 0, 0);
-var v2 = v1 with { Y = 1 };
-
-// readonly record struct = immutable record struct (recommended)
-public readonly record struct Color(byte R, byte G, byte B)
-{
-    public static readonly Color Red   = new(255, 0, 0);
-    public static readonly Color Green = new(0, 255, 0);
-    public static readonly Color Blue  = new(0, 0, 255);
-
-    public Color Mix(Color other) => new(
-        (byte)((R + other.R) / 2),
-        (byte)((G + other.G) / 2),
-        (byte)((B + other.B) / 2));
-
-    public override string ToString() => $"#{R:X2}{G:X2}{B:X2}";
+    public required string Street { get; init; }
+    public required string City   { get; init; }
+    public string? PostCode        { get; init; }
 }
 ```
 
-### Record Inheritance
+### `init` — Set-Once Properties
+
+The `init` accessor allows a property to be set only in an object
+initialiser or constructor, never afterwards. This provides compile-time
+immutability without requiring a full record:
 
 ```csharp
-public abstract record Shape(string Color);
-public record Circle(string Color, double Radius) : Shape(Color);
-public record Rectangle(string Color, double Width, double Height) : Shape(Color);
+public class Order
+{
+    public int    Id          { get; init; }  // set once, never changed
+    public string CustomerId  { get; init; } = "";
+    public Status Status      { get; set; }  // mutable
+}
 
-// Equality is type-aware
-Shape c1 = new Circle("red", 5);
-Shape c2 = new Circle("red", 5);
-Console.WriteLine(c1 == c2); // True
-
-Shape r = new Rectangle("red", 5, 5);
-Console.WriteLine(c1 == r); // False — different runtime types
+var order = new Order { Id = 1, CustomerId = "C001" };
+order.Status = Status.Processing;  // fine — Status has set
+order.Id = 2;                       // ERROR — Id has init, not set
 ```
 
 ---
 
-## 2.7 Structs
+## 2.7 Structs — Value Types You Define Yourself
 
-Structs are value types. Use them for small, short-lived, frequently copied data.
-
-### When to Use Structs
-
-- Small (≤16 bytes recommended, ≤32 bytes acceptable)
-- Logically a single value (Point, Color, Money, Temperature)
-- Immutable (readonly struct)
-- No inheritance needed
-- Not boxed often
+A `struct` is a value type you define. It is stored inline (on the stack
+or in the containing object) — no heap allocation, no GC pressure. Use
+structs for small, immutable data blobs where performance matters and
+the data is logically a single value.
 
 ```csharp
-// Basic struct
-public struct Point2D
+// A good candidate for struct: small, logically atomic, immutable
+public readonly struct Money
 {
-    public float X;
-    public float Y;
+    public decimal Amount   { get; }
+    public string  Currency { get; }
 
-    public Point2D(float x, float y) { X = x; Y = y; }
-    public float Distance(Point2D other)
-        => MathF.Sqrt(MathF.Pow(X - other.X, 2) + MathF.Pow(Y - other.Y, 2));
-}
-
-// readonly struct — all fields must be readonly, methods don't copy
-public readonly struct Temperature
-{
-    public double Celsius { get; }
-    public double Fahrenheit => Celsius * 9 / 5 + 32;
-    public double Kelvin => Celsius + 273.15;
-
-    public Temperature(double celsius) => Celsius = celsius;
-
-    public static Temperature FromFahrenheit(double f) => new((f - 32) * 5 / 9);
-    public static Temperature FromKelvin(double k) => new(k - 273.15);
-
-    public override string ToString() => $"{Celsius:F1}°C";
-
-    // Operators
-    public static Temperature operator +(Temperature a, Temperature b)
-        => new(a.Celsius + b.Celsius);
-    public static bool operator >(Temperature a, Temperature b)
-        => a.Celsius > b.Celsius;
-    public static bool operator <(Temperature a, Temperature b)
-        => a.Celsius < b.Celsius;
-}
-```
-
-### `ref struct` — Stack-Only
-
-```csharp
-// ref struct cannot be boxed, stored on heap, or used in async methods
-// Used for: Span<T>, ReadOnlySpan<T>, custom stack-allocated types
-public ref struct BufferWriter
-{
-    private Span<byte> _buffer;
-    private int _position;
-
-    public BufferWriter(Span<byte> buffer)
+    public Money(decimal amount, string currency)
     {
-        _buffer = buffer;
-        _position = 0;
+        if (amount < 0) throw new ArgumentOutOfRangeException(nameof(amount));
+        Amount   = amount;
+        Currency = currency ?? throw new ArgumentNullException(nameof(currency));
     }
 
-    public void Write(byte value) => _buffer[_position++] = value;
-    public int Written => _position;
+    // Structs should override Equals and GetHashCode for correctness
+    public override bool Equals(object? obj) =>
+        obj is Money m && m.Amount == Amount && m.Currency == Currency;
+    public override int GetHashCode() => HashCode.Combine(Amount, Currency);
+    public override string ToString() => $"{Amount} {Currency}";
+
+    public static Money operator +(Money a, Money b)
+    {
+        if (a.Currency != b.Currency)
+            throw new InvalidOperationException("Currency mismatch");
+        return new Money(a.Amount + b.Amount, a.Currency);
+    }
 }
 
-// Usage:
-Span<byte> stack = stackalloc byte[256];
-var writer = new BufferWriter(stack);
-writer.Write(0xFF);
+var price = new Money(9.99m, "EUR");
+var tax   = new Money(0.85m, "EUR");
+var total = price + tax;  // 10.84 EUR — no heap allocation
 ```
 
-### Struct Interfaces (C# 13+: allows default members)
+### `record struct` — Value Type With Record Benefits
+
+C# 10+ introduces `record struct`: a value type with auto-generated value
+equality and `with` expressions.
 
 ```csharp
-public interface IAddable<T> where T : IAddable<T>
-{
-    static abstract T operator +(T a, T b);
-}
+public record struct Point(double X, double Y);
 
-public readonly struct Meters : IAddable<Meters>
-{
-    public double Value { get; }
-    public Meters(double value) => Value = value;
-    public static Meters operator +(Meters a, Meters b) => new(a.Value + b.Value);
-    public override string ToString() => $"{Value}m";
-}
-
-// Generic method using static abstract member
-T Sum<T>(IEnumerable<T> items, T initial) where T : IAddable<T>
-    => items.Aggregate(initial, (acc, x) => acc + x);
+var p1 = new Point(1.0, 2.0);
+var p2 = new Point(1.0, 2.0);
+Console.WriteLine(p1 == p2);          // True — value equality (struct default)
+var p3 = p1 with { X = 5.0 };        // non-destructive mutation
 ```
+
+### When to Use Struct vs Class
+
+| Use `struct` when | Use `class` when |
+|---|---|
+| Data is small (16 bytes or less) | Data is large (many fields) |
+| Data is logically a single value | Object has identity beyond its data |
+| Allocation-sensitive hot path | Shared across many places |
+| Immutable | Mutable with complex state |
+| `Money`, `Coordinate`, `Color`, `Size` | `Order`, `User`, `Connection`, `Repository` |
 
 ---
 
-## 2.8 Enums
+## 2.8 Enums — Named Constants With a Type
+
+An enum defines a set of named integer constants. The name is the
+documentation — it makes the intent of a value unmistakably clear.
 
 ```csharp
-// Basic enum (backed by int by default)
-public enum Direction { North, South, East, West }
+// Without enum: a boolean parameter that no one understands at the call site
+ProcessFile(true, false);    // what do these mean?
 
-// Explicit backing type
-public enum StatusCode : byte { Ok = 200, NotFound = 404, Error = 500 }
+// With enum: the call site is self-documenting
+public enum CompressionMode { None, Gzip, Brotli, Deflate }
+public enum EncryptionMode  { None, Aes128, Aes256 }
 
-// Flags enum (bitfield)
+ProcessFile(CompressionMode.Gzip, EncryptionMode.Aes256);  // clear!
+```
+
+```csharp
+// Flags enum: combinable values — use powers of 2
 [Flags]
-public enum Permission
+public enum Permissions
 {
     None    = 0,
     Read    = 1 << 0,  // 1
     Write   = 1 << 1,  // 2
     Execute = 1 << 2,  // 4
-    Admin   = Read | Write | Execute  // 7
+    All     = Read | Write | Execute
 }
 
-// Usage
-var perm = Permission.Read | Permission.Write;
-bool canRead  = perm.HasFlag(Permission.Read);   // true
-bool canExec  = perm.HasFlag(Permission.Execute); // false
-var allPerms  = Permission.Admin;
-Console.WriteLine(perm);       // "Read, Write"
-Console.WriteLine(allPerms);   // "Admin"
-
-// Parsing
-Direction d = Enum.Parse<Direction>("North");
-bool ok = Enum.TryParse<Direction>("South", out var dir);
-string[] names = Enum.GetNames<Direction>();
-Direction[] values = Enum.GetValues<Direction>();
+var perms = Permissions.Read | Permissions.Write;
+Console.WriteLine(perms);                            // Read, Write
+Console.WriteLine(perms.HasFlag(Permissions.Write)); // True
+Console.WriteLine(perms.HasFlag(Permissions.Execute)); // False
 ```
 
-### Enum Extensions Pattern
+```csharp
+// Switch over enum — pattern matching ensures exhaustiveness (see Ch 3)
+string Describe(CompressionMode mode) => mode switch
+{
+    CompressionMode.None    => "uncompressed",
+    CompressionMode.Gzip    => "gzip compressed",
+    CompressionMode.Brotli  => "brotli compressed",
+    CompressionMode.Deflate => "deflate compressed",
+    _ => throw new ArgumentOutOfRangeException(nameof(mode))
+};
+```
+
+---
+
+## 2.9 Generics — One Algorithm, Any Type
+
+Before generics, collections worked by storing everything as `object`,
+requiring casts on retrieval and losing type safety entirely. Generics
+allow you to write code parametrised over a type that is filled in at
+compile time, giving you both type safety and performance (no boxing for
+value types).
 
 ```csharp
-public static class DirectionExtensions
+// Non-generic: loses type information, requires cast, boxes value types
+ArrayList list = new ArrayList();
+list.Add(42);
+int n = (int)list[0];   // cast required, easy to get wrong
+
+// Generic: type-safe, no boxing, no cast
+List<int> typed = new List<int>();
+typed.Add(42);
+int m = typed[0];       // no cast — compiler knows it is int
+```
+
+### Defining Generic Types
+
+```csharp
+// Generic class: T is a type parameter — filled in by the caller
+public class Repository<T> where T : class, new()
 {
-    public static Direction Opposite(this Direction d) => d switch
+    private readonly List<T> _items = new();
+
+    public void Add(T item) => _items.Add(item);
+    public T? Find(Func<T, bool> predicate) => _items.FirstOrDefault(predicate);
+    public IReadOnlyList<T> GetAll() => _items.AsReadOnly();
+}
+
+var orders = new Repository<Order>();
+orders.Add(new Order());
+Order? first = orders.Find(o => o.Status == Status.Pending);
+```
+
+### Generic Constraints
+
+Constraints tell the compiler what operations are available on `T`:
+
+```csharp
+where T : class        // T must be a reference type
+where T : struct       // T must be a value type
+where T : new()        // T must have a parameterless constructor
+where T : SomeClass    // T must inherit from SomeClass
+where T : IComparable<T>  // T must implement the interface
+where T : notnull      // T cannot be null (value type or non-nullable reference)
+```
+
+---
+
+## 2.10 Type Aliases, Tuple Types, and Primary Constructors
+
+### Type Aliases (C# 12+)
+
+A type alias gives a familiar type a more meaningful name in context:
+
+```csharp
+using OrderId     = System.Guid;
+using CustomerId  = System.Guid;
+using Price       = System.Decimal;
+
+// Now these reads like domain language
+OrderId    orderId    = Guid.NewGuid();
+CustomerId customerId = Guid.NewGuid();
+Price      total      = 99.99m;
+```
+
+This is documentation that the compiler sees. A method that takes
+`CustomerId` will not accidentally accept an `OrderId` — they are both
+`Guid` but the alias makes the intent explicit.
+
+### Tuple Types
+
+Tuples let you return multiple values from a method without defining a
+class or struct:
+
+```csharp
+// Named tuple return type
+public (bool Success, string? ErrorMessage) TryParse(string input)
+{
+    if (string.IsNullOrWhiteSpace(input))
+        return (false, "Input was empty");
+    return (true, null);
+}
+
+var (ok, err) = TryParse("");
+if (!ok) Console.WriteLine(err);  // Input was empty
+```
+
+Prefer named tuples (with element names) over positional tuples
+(`(bool, string?)`) — the names are documentation and prevent mixing up
+the meaning of position 0 vs position 1.
+
+### Primary Constructors (C# 12+)
+
+Primary constructors allow constructor parameters directly in the class
+or struct declaration, eliminating boilerplate for types that just store
+their constructor arguments:
+
+```csharp
+// Traditional: field declarations + constructor assignment
+public class PaymentService
+{
+    private readonly IPaymentGateway _gateway;
+    private readonly ILogger<PaymentService> _logger;
+
+    public PaymentService(IPaymentGateway gateway, ILogger<PaymentService> logger)
     {
-        Direction.North => Direction.South,
-        Direction.South => Direction.North,
-        Direction.East  => Direction.West,
-        Direction.West  => Direction.East,
-        _ => throw new ArgumentOutOfRangeException(nameof(d))
-    };
-
-    public static (int dx, int dy) ToVector(this Direction d) => d switch
-    {
-        Direction.North => (0, 1),
-        Direction.South => (0, -1),
-        Direction.East  => (1, 0),
-        Direction.West  => (-1, 0),
-        _ => throw new ArgumentOutOfRangeException(nameof(d))
-    };
-}
-```
-
----
-
-## 2.9 Generics
-
-### Generic Classes and Methods
-
-```csharp
-// Generic class
-public class Repository<T> where T : class, IEntity
-{
-    private readonly List<T> _store = new();
-
-    public void Add(T item)        => _store.Add(item);
-    public T?   Get(int id)        => _store.FirstOrDefault(x => x.Id == id);
-    public IReadOnlyList<T> GetAll() => _store.AsReadOnly();
-}
-
-// Generic method
-public static T? MaxBy<T, TKey>(IEnumerable<T> source, Func<T, TKey> keySelector)
-    where TKey : IComparable<TKey>
-{
-    T? best = default;
-    TKey? bestKey = default;
-    bool first = true;
-    foreach (var item in source)
-    {
-        var key = keySelector(item);
-        if (first || key.CompareTo(bestKey!) > 0)
-        {
-            best = item;
-            bestKey = key;
-            first = false;
-        }
-    }
-    return best;
-}
-```
-
-### Constraints
-
-```csharp
-where T : struct           // value type
-where T : class            // reference type
-where T : class?           // nullable reference type
-where T : notnull          // non-nullable (value type or non-nullable ref)
-where T : unmanaged        // unmanaged value type (can use in Span<T>, stackalloc)
-where T : new()            // has parameterless constructor
-where T : SomeBaseClass    // inherits from base
-where T : ISomeInterface   // implements interface
-where T : ISomeInterface, new()  // multiple constraints
-
-// C# 11: static abstract members in interfaces
-where T : INumber<T>       // numeric type (System.Numerics)
-```
-
-### Common Generic Patterns
-
-```csharp
-// Result<T> monad pattern
-public readonly record struct Result<T>
-{
-    public T? Value { get; }
-    public string? Error { get; }
-    public bool IsSuccess => Error is null;
-
-    private Result(T value) { Value = value; Error = null; }
-    private Result(string error) { Value = default; Error = error; }
-
-    public static Result<T> Ok(T value)       => new(value);
-    public static Result<T> Fail(string error) => new(error);
-
-    public Result<TOut> Map<TOut>(Func<T, TOut> f)
-        => IsSuccess ? Result<TOut>.Ok(f(Value!)) : Result<TOut>.Fail(Error!);
-
-    public Result<TOut> Bind<TOut>(Func<T, Result<TOut>> f)
-        => IsSuccess ? f(Value!) : Result<TOut>.Fail(Error!);
-
-    public T GetOrThrow() => IsSuccess ? Value! : throw new InvalidOperationException(Error);
-    public T GetOrDefault(T defaultValue) => IsSuccess ? Value! : defaultValue;
-}
-
-// Usage
-Result<int> Parse(string s)
-    => int.TryParse(s, out var n) ? Result<int>.Ok(n) : Result<int>.Fail($"'{s}' is not a number");
-
-var result = Parse("42")
-    .Map(n => n * 2)
-    .Bind(n => n > 50 ? Result<int>.Ok(n) : Result<int>.Fail("Too small"));
-```
-
-### Covariance and Contravariance
-
-```csharp
-// Covariant (out T) — can return T as more base type
-// IEnumerable<Derived> is assignable to IEnumerable<Base>
-IEnumerable<string> strings = new List<string> { "a", "b" };
-IEnumerable<object> objects = strings;  // OK — covariant
-
-// Custom covariant interface
-public interface IProducer<out T>
-{
-    T Produce();
-}
-
-// Contravariant (in T) — can accept T as more derived type
-// IComparer<Base> is assignable to IComparer<Derived>
-IComparer<object> objectComp = Comparer<object>.Default;
-IComparer<string> stringComp = objectComp;  // OK — contravariant
-
-// Custom contravariant interface
-public interface IConsumer<in T>
-{
-    void Consume(T item);
-}
-```
-
----
-
-## 2.10 Type Aliases (C# 12+)
-
-```csharp
-// File-scoped type alias
-using Point = (double X, double Y);
-using Matrix = double[][];
-using UserId = System.Guid;
-using Callback = System.Action<string, System.Threading.CancellationToken>;
-
-// Usage
-Point origin = (0, 0);
-UserId id = Guid.NewGuid();
-```
-
----
-
-## 2.11 Tuple Types
-
-```csharp
-// Named tuple (ValueTuple<T1, T2, ...>)
-(string Name, int Age) person = ("Alice", 30);
-Console.WriteLine(person.Name);  // Alice
-Console.WriteLine(person.Age);   // 30
-
-// Return multiple values
-(string, bool) TryParse(string s)
-{
-    bool ok = int.TryParse(s, out _);
-    return (s, ok);
-}
-
-// Tuple deconstruction
-var (name, age) = person;
-var (text, success) = TryParse("42");
-
-// Discard unused element
-var (_, isOk) = TryParse("xyz");
-
-// Tuple equality
-var t1 = (1, "hello");
-var t2 = (1, "hello");
-Console.WriteLine(t1 == t2);  // True
-
-// Swap idiom
-int a = 1, b = 2;
-(a, b) = (b, a);  // a=2, b=1
-```
-
----
-
-## 2.12 `dynamic` and `object`
-
-```csharp
-// object — everything derives from it, requires casting
-object o = 42;
-int i = (int)o;       // explicit cast
-int j = o as int? ?? 0; // as + null coalesce
-
-// dynamic — bypasses compile-time type checking, resolved at runtime
-dynamic d = 42;
-d = "now I'm a string"; // no compile error
-Console.WriteLine(d.Length); // 16 — works at runtime (IronPython style)
-
-// Use case: COM interop, ExpandoObject, working with JSON in dynamic context
-dynamic expando = new System.Dynamic.ExpandoObject();
-expando.Name = "Alice";
-expando.Age = 30;
-Console.WriteLine(expando.Name);
-```
-
-> **Rider tip:** For NRT, enable *Inspect Code* (`Ctrl+Alt+Shift+I` / `⌘⌥⇧I`) and run *Null value analysis* inspection. Rider shows squiggles for potential null dereferences even beyond what the compiler reports.
-
-> **VS tip:** *Analyze → Run Code Analysis on Solution* → *Nullable reference types* rule set catches all NRT issues project-wide.
-
-
----
-
-## 2.13 Primary Constructors (C# 12)
-
-Primary constructors bring constructor parameters directly into the class body,
-eliminating the boilerplate of declaring a field and assigning it:
-
-```csharp
-// C# 12+ primary constructor on class
-public class OrderService(
-    IOrderRepository orders,
-    IEmailSender email,
-    ILogger<OrderService> logger)
-{
-    // Parameters are in scope for the entire class body
-    public async Task PlaceOrderAsync(Order order, CancellationToken ct)
-    {
-        await orders.SaveAsync(order, ct);                         // direct use
-        await email.SendAsync(order.CustomerEmail, "Confirmed", ct);
-        logger.LogInformation("Order {Id} placed", order.Id);
+        _gateway = gateway;
+        _logger  = logger;
     }
 }
 
-// The old equivalent (still valid, sometimes clearer):
-public class OrderService
+// Primary constructor: parameters are captured automatically
+public class PaymentService(IPaymentGateway gateway, ILogger<PaymentService> logger)
 {
-    private readonly IOrderRepository _orders;
-    private readonly IEmailSender     _email;
-    private readonly ILogger<OrderService> _logger;
-
-    public OrderService(IOrderRepository orders, IEmailSender email,
-        ILogger<OrderService> logger)
+    public async Task<Result> ChargeAsync(decimal amount, CancellationToken ct)
     {
-        _orders = orders;
-        _email  = email;
-        _logger = logger;
+        _logger.LogInformation("Charging {Amount}", amount);
+        return await gateway.ChargeAsync(amount, ct);  // parameters in scope
     }
-}
-
-// Primary constructors also work on structs:
-public readonly struct Temperature(double celsius)
-{
-    public double Celsius    => celsius;
-    public double Fahrenheit => celsius * 9 / 5 + 32;
 }
 ```
 
-**When to prefer primary constructors:** service classes with many injected dependencies
-where you don't need field-level access modifiers or XML doc comments per field.
-**When to avoid:** when you need to validate parameters before assignment, or when
-field names in the IDE are important for navigation.
+Primary constructors are the preferred style in .NET 9 code for
+dependency-injected services. They reduce noise and make the dependency
+list visible in the class declaration line.
 
+---
 
+## 2.11 `dynamic` — Escape Hatch With a Cost
+
+`dynamic` defers type checking to runtime. The compiler will accept any
+operation on a `dynamic` value without checking whether it is valid. The
+runtime will throw `RuntimeBinderException` if the operation fails.
+
+Use `dynamic` only for COM interop, scripting hosts, or consuming APIs
+that genuinely have no types available. In application code, `dynamic`
+eliminates the compiler's ability to catch errors and degrades
+performance (every operation involves reflection-like dispatch).
+
+```csharp
+// Legitimate use: interacting with COM (Office Automation)
+dynamic excel = Activator.CreateInstance(Type.GetTypeFromProgID("Excel.Application")!);
+excel.Visible = true;
+
+// Never use dynamic to avoid writing proper types:
+dynamic data = GetSomeData();   // bad — you have given up type safety
+data.DoSomething();             // the compiler cannot verify this
+```
+
+---
+
+## 2.12 Connecting Types to the Rest of the Book
+
+Every chapter that follows uses types. Here is how this chapter connects:
+
+- **Ch 3 (Control Flow)** — pattern matching switches on types and
+  deconstructs records and tuples.
+- **Ch 4 (Methods)** — generic type parameters, delegates, and
+  `Func<T>` / `Action<T>` all build on generics.
+- **Ch 5 (OOP)** — interfaces, inheritance, and covariance are all
+  type-system features.
+- **Ch 6 (Principles)** — "Make Illegal States Unrepresentable" and
+  "Domain Primitives" use value types, records, and `init` properties.
+- **Ch 7 (Collections)** — `List<T>`, `Dictionary<K,V>` are all generic
+  types from the BCL.
+- **Ch 8 (Async)** — `Task<T>`, `ValueTask<T>`, `IAsyncEnumerable<T>`
+  are all generic types.
+- **Ch 15a (SQL)** — nullable value types (`int?`, `DateTime?`) map
+  directly to SQL nullable columns.
+- **Ch 26 (Memory)** — the value-vs-reference distinction is exactly
+  the stack-vs-heap allocation distinction.

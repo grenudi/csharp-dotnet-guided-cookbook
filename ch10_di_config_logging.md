@@ -1,601 +1,366 @@
 # Chapter 10 — Dependency Injection, Configuration & Logging
 
-> This chapter covers DI, Options, and Logging in the context of ASP.NET Core and Worker services.
-> For a standalone deep-dive with fully runnable examples covering every DI concept from scratch,
-> see **[Chapter 19 — Dependency Injection: The Complete Picture](ch19_di_deep_dive.md)**.
+> Three concerns — how your application gets its dependencies, how it
+> reads its settings, and how it records what it does — are entangled by
+> design in .NET. They share the same container, the same startup wiring,
+> and the same host model. This chapter introduces all three together,
+> which is how they appear in real projects. Chapter 11 then dives deep
+> into DI alone with standalone examples.
 
-## 10.1 Dependency Injection (DI)
-
-`Microsoft.Extensions.DependencyInjection` is the built-in DI container.
-
-### Service Lifetimes
-
-| Lifetime | Scope | Created |
-|----------|-------|---------|
-| **Transient** | New instance every resolve | `AddTransient<TService, TImpl>()` |
-| **Scoped** | Once per request/scope | `AddScoped<TService, TImpl>()` |
-| **Singleton** | Once per application lifetime | `AddSingleton<TService, TImpl>()` |
-
-```
-Request 1:
-  Resolve IService (Scoped) → instance A
-  Resolve IService (Scoped) → instance A (same scope)
-  Resolve ITransient       → instance X
-  Resolve ITransient       → instance Y (new each time)
-  Resolve ISingleton       → instance S
-  [end of request] → A disposed
-
-Request 2:
-  Resolve IService (Scoped) → instance B (new scope)
-  Resolve ISingleton       → instance S (same singleton)
-```
-
-### Setting Up the Container
-
-#### Console App / Worker
-
-```csharp
-// Program.cs
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-
-var host = Host.CreateDefaultBuilder(args)
-    .ConfigureServices((context, services) =>
-    {
-        // Register services
-        services.AddTransient<IEmailSender, SmtpEmailSender>();
-        services.AddScoped<IOrderService, OrderService>();
-        services.AddSingleton<ICache, MemoryCache>();
-
-        // Register with factory
-        services.AddSingleton<IDbConnection>(_ =>
-            new SqlConnection(context.Configuration.GetConnectionString("Default")));
-
-        // Register all implementations of an interface
-        services.AddTransient<IPlugin, PluginA>();
-        services.AddTransient<IPlugin, PluginB>(); // IEnumerable<IPlugin> injection works!
-
-        // Register options
-        services.Configure<SmtpOptions>(context.Configuration.GetSection("Smtp"));
-
-        // Background service
-        services.AddHostedService<MyWorker>();
-    })
-    .Build();
-
-await host.RunAsync();
-```
-
-#### ASP.NET Core
-
-```csharp
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-// Application services
-builder.Services.AddScoped<IUserService, UserService>();
-builder.Services.AddSingleton<IEventBus, InMemoryEventBus>();
-
-// EF Core
-builder.Services.AddDbContext<AppDbContext>(opt =>
-    opt.UseSqlite(builder.Configuration.GetConnectionString("Default")));
-
-// HttpClient with named/typed
-builder.Services.AddHttpClient<IGithubClient, GithubClient>(client =>
-{
-    client.BaseAddress = new Uri("https://api.github.com/");
-    client.DefaultRequestHeaders.Add("User-Agent", "MyApp/1.0");
-});
-
-var app = builder.Build();
-// ...
-```
-
-### Injecting Dependencies
-
-```csharp
-// Constructor injection (preferred)
-public class OrderService : IOrderService
-{
-    private readonly IRepository<Order> _orders;
-    private readonly IEmailSender _email;
-    private readonly ILogger<OrderService> _logger;
-
-    public OrderService(
-        IRepository<Order> orders,
-        IEmailSender email,
-        ILogger<OrderService> logger)
-    {
-        _orders = orders;
-        _email = email;
-        _logger = logger;
-    }
-
-    public async Task PlaceOrderAsync(Order order, CancellationToken ct)
-    {
-        await _orders.AddAsync(order, ct);
-        await _email.SendAsync(order.CustomerEmail, "Order placed", ..., ct);
-        _logger.LogInformation("Order {OrderId} placed", order.Id);
-    }
-}
-
-// Inject IEnumerable<T> — gets all registrations
-public class PluginRunner
-{
-    private readonly IEnumerable<IPlugin> _plugins;
-    public PluginRunner(IEnumerable<IPlugin> plugins) => _plugins = plugins;
-
-    public async Task RunAllAsync()
-    {
-        foreach (var plugin in _plugins)
-            await plugin.RunAsync();
-    }
-}
-
-// Inject factory — avoid resolving transient from singleton (captive dependency)
-public class MySingleton
-{
-    private readonly IServiceScopeFactory _scopeFactory;
-
-    public MySingleton(IServiceScopeFactory scopeFactory)
-        => _scopeFactory = scopeFactory;
-
-    public async Task DoWorkAsync()
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var scoped = scope.ServiceProvider.GetRequiredService<IScopedService>();
-        await scoped.DoAsync();
-    }
-}
-```
-
-### Keyed Services (NET 8+)
-
-```csharp
-// Register with key
-services.AddKeyedSingleton<ICache, MemoryCache>("memory");
-services.AddKeyedSingleton<ICache, RedisCache>("redis");
-
-// Inject by key
-public class MyService
-{
-    private readonly ICache _memCache;
-    private readonly ICache _redisCache;
-
-    public MyService(
-        [FromKeyedServices("memory")] ICache memCache,
-        [FromKeyedServices("redis")]  ICache redisCache)
-    {
-        _memCache  = memCache;
-        _redisCache = redisCache;
-    }
-}
-
-// Resolve manually
-var redis = sp.GetRequiredKeyedService<ICache>("redis");
-```
-
-### Extension Method Pattern for Service Registration
-
-```csharp
-// Organize DI into extension methods per feature
-public static class OrderingServiceExtensions
-{
-    public static IServiceCollection AddOrdering(
-        this IServiceCollection services,
-        IConfiguration config)
-    {
-        services.AddScoped<IOrderService, OrderService>();
-        services.AddScoped<IOrderRepository, SqlOrderRepository>();
-        services.AddScoped<IPaymentGateway, StripePaymentGateway>();
-        services.Configure<OrderOptions>(config.GetSection("Ordering"));
-        return services;
-    }
-}
-
-// Usage
-builder.Services.AddOrdering(builder.Configuration);
-```
+*Building on:* Ch 5 (interfaces, why you abstract), Ch 9 (environment
+variables, the configuration sources), Ch 4 (extension methods — the
+DI registration pattern)
 
 ---
 
-## 10.2 Options Pattern
+## 10.1 Dependency Injection — The Problem It Solves
 
-### Defining Options
-
-```csharp
-public class SmtpOptions
-{
-    public const string SectionName = "Smtp";
-
-    [Required]
-    public string Host { get; set; } = "";
-
-    [Range(1, 65535)]
-    public int Port { get; set; } = 587;
-
-    public bool UseSsl { get; set; } = true;
-
-    [Required]
-    public string Username { get; set; } = "";
-
-    [Required]
-    public string Password { get; set; } = "";
-
-    public int TimeoutSeconds { get; set; } = 30;
-}
-```
-
-### `appsettings.json`
-
-```json
-{
-  "Smtp": {
-    "Host": "smtp.gmail.com",
-    "Port": 587,
-    "UseSsl": true,
-    "Username": "user@gmail.com",
-    "Password": "app-password",
-    "TimeoutSeconds": 30
-  }
-}
-```
-
-### Registering
+Before DI, you constructed dependencies directly:
 
 ```csharp
-services.AddOptions<SmtpOptions>()
-    .BindConfiguration(SmtpOptions.SectionName)
-    .ValidateDataAnnotations()
-    .ValidateOnStart();   // fail at startup if invalid, not on first use
-```
-
-### Injecting Options
-
-```csharp
-// IOptions<T> — singleton, does not reload
-public class EmailSender
-{
-    private readonly SmtpOptions _opts;
-    public EmailSender(IOptions<SmtpOptions> opts) => _opts = opts.Value;
-}
-
-// IOptionsSnapshot<T> — scoped, reloads per scope
-public class FeatureService
-{
-    private readonly FeatureOptions _opts;
-    public FeatureService(IOptionsSnapshot<FeatureOptions> opts) => _opts = opts.Value;
-}
-
-// IOptionsMonitor<T> — singleton, hot reload support
-public class ConfigWatcher
-{
-    private readonly IOptionsMonitor<AppOptions> _monitor;
-    private IDisposable? _sub;
-
-    public ConfigWatcher(IOptionsMonitor<AppOptions> monitor)
-    {
-        _monitor = monitor;
-        _sub = monitor.OnChange(opts =>
-        {
-            Console.WriteLine($"Config changed: {opts.Setting}");
-        });
-    }
-}
-```
-
-### Named Options
-
-```csharp
-// Register multiple named options
-services.Configure<ConnectionOptions>("primary", config.GetSection("Connections:Primary"));
-services.Configure<ConnectionOptions>("replica", config.GetSection("Connections:Replica"));
-
-// Inject
-public class DbRouter
-{
-    private readonly ConnectionOptions _primary;
-    private readonly ConnectionOptions _replica;
-
-    public DbRouter(IOptionsMonitor<ConnectionOptions> opts)
-    {
-        _primary = opts.Get("primary");
-        _replica = opts.Get("replica");
-    }
-}
-```
-
----
-
-## 10.3 Configuration
-
-### Configuration Providers (in priority order, last wins)
-
-```
-appsettings.json
-  → appsettings.{Environment}.json
-    → Environment variables
-      → Command-line arguments
-        → User secrets (Development only)
-```
-
-### `appsettings.json` Full Example
-
-```json
-{
-  "ConnectionStrings": {
-    "Default": "Data Source=app.db"
-  },
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning",
-      "Microsoft.EntityFrameworkCore": "Warning"
-    }
-  },
-  "AllowedHosts": "*",
-  "App": {
-    "Name": "MyApp",
-    "Version": "1.0.0",
-    "Features": {
-      "EnableBeta": false,
-      "MaxRetries": 3
-    }
-  },
-  "Smtp": {
-    "Host": "smtp.example.com",
-    "Port": 587
-  }
-}
-```
-
-### Accessing Configuration
-
-```csharp
-// Direct access (avoid in app code — use Options pattern instead)
-string conn = config["ConnectionStrings:Default"]!;
-string host = config.GetConnectionString("Default")!;
-string app  = config.GetSection("App")["Name"]!;
-
-// Bind section to typed object
-var smtpOpts = config.GetSection("Smtp").Get<SmtpOptions>()!;
-
-// Bind with validation
-var opts = new SmtpOptions();
-config.GetSection("Smtp").Bind(opts);
-
-// In service registration
-services.Configure<SmtpOptions>(config.GetSection("Smtp"));
-```
-
-### Environment Variables
-
-```bash
-# Override nested config: use double underscore __ as separator
-export App__Features__EnableBeta=true
-export ConnectionStrings__Default="Server=prod-db;..."
-
-# In Docker Compose:
-environment:
-  - App__Features__EnableBeta=true
-  - ConnectionStrings__Default=Server=db;Database=prod;
-```
-
-### User Secrets (Development)
-
-```bash
-# Initialize
-dotnet user-secrets init
-
-# Set
-dotnet user-secrets set "Smtp:Password" "super-secret"
-dotnet user-secrets set "ConnectionStrings:Default" "Server=localhost;..."
-
-# List
-dotnet user-secrets list
-
-# Remove
-dotnet user-secrets remove "Smtp:Password"
-```
-
-User secrets are stored at:
-- Linux/macOS: `~/.microsoft/usersecrets/{userSecretsId}/secrets.json`
-- Windows: `%APPDATA%\Microsoft\UserSecrets\{userSecretsId}\secrets.json`
-
-### Custom Configuration Provider
-
-```csharp
-// Add configuration from database or any custom source
-public class DatabaseConfigurationSource : IConfigurationSource
-{
-    private readonly string _connectionString;
-    public DatabaseConfigurationSource(string cs) => _connectionString = cs;
-
-    public IConfigurationProvider Build(IConfigurationBuilder builder)
-        => new DatabaseConfigurationProvider(_connectionString);
-}
-
-public class DatabaseConfigurationProvider : ConfigurationProvider
-{
-    private readonly string _cs;
-    public DatabaseConfigurationProvider(string cs) => _cs = cs;
-
-    public override void Load()
-    {
-        using var conn = new SqlConnection(_cs);
-        var pairs = conn.Query<(string Key, string Value)>(
-            "SELECT [Key], [Value] FROM AppConfig WHERE IsActive = 1");
-        Data = pairs.ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
-    }
-}
-
-// Register
-builder.Configuration.Add(new DatabaseConfigurationSource(connectionString));
-```
-
----
-
-## 10.4 Logging
-
-### Basic Usage
-
-```csharp
+// Without DI: every class builds its own dependencies
 public class OrderService
 {
-    private readonly ILogger<OrderService> _logger;
+    private readonly OrderRepository _repo;
+    private readonly EmailService    _email;
+    private readonly PaymentGateway  _payment;
 
-    public OrderService(ILogger<OrderService> logger) => _logger = logger;
-
-    public async Task PlaceOrderAsync(string orderId, decimal total)
+    public OrderService()
     {
-        _logger.LogInformation("Placing order {OrderId} for {Total:C}", orderId, total);
-
-        try
-        {
-            await SaveOrderAsync(orderId);
-            _logger.LogInformation("Order {OrderId} saved successfully", orderId);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save order {OrderId}", orderId);
-            throw;
-        }
+        var connStr  = Environment.GetEnvironmentVariable("DB_CONNECTION")!;
+        _repo    = new OrderRepository(new SqlConnection(connStr));
+        _email   = new EmailService(new SmtpClient("smtp.example.com"));
+        _payment = new PaymentGateway(new HttpClient());
     }
 }
 ```
 
-### Log Levels
+Problems with this approach:
+1. `OrderService` must know how to construct each dependency — it has
+   knowledge it should not have
+2. You cannot swap implementations — tests must use the real database
+3. Lifetime management is manual — who disposes `SqlConnection`?
+4. Configuration changes require editing source code
+
+DI inverts this: you describe *what* you need, and a container *provides*
+it. The container knows how to construct everything. The service declares
+its needs through its constructor:
 
 ```csharp
-_logger.LogTrace("Detailed trace for debugging");      // Trace (0)
-_logger.LogDebug("Debug info: {Value}", someValue);    // Debug (1)
-_logger.LogInformation("User {UserId} logged in", id); // Information (2)
-_logger.LogWarning("Retry {Count} for {Url}", n, url); // Warning (3)
-_logger.LogError(ex, "Error processing {Item}", item); // Error (4)
-_logger.LogCritical("Database unavailable!");          // Critical (5)
-
-// Check before logging expensive operations
-if (_logger.IsEnabled(LogLevel.Debug))
-    _logger.LogDebug("Expensive debug info: {Data}", ComputeExpensiveData());
-```
-
-### Structured Logging with Serilog
-
-```csharp
-// Install: Serilog.AspNetCore, Serilog.Sinks.Console, Serilog.Sinks.File
-
-// Program.cs
-using Serilog;
-
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Debug()
-    .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-    .MinimumLevel.Override("System", LogEventLevel.Warning)
-    .Enrich.FromLogContext()
-    .Enrich.WithMachineName()
-    .Enrich.WithEnvironmentName()
-    .WriteTo.Console(outputTemplate:
-        "[{Timestamp:HH:mm:ss} {Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}")
-    .WriteTo.File("logs/app-.log",
-        rollingInterval: RollingInterval.Day,
-        retainedFileCountLimit: 7,
-        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}")
-    .WriteTo.Seq("http://localhost:5341")  // structured log viewer
-    .CreateLogger();
-
-builder.Host.UseSerilog();
-
-// Or inline builder:
-builder.Host.UseSerilog((ctx, services, config) =>
+// With DI: declare what you need, the container provides it
+public class OrderService(
+    IOrderRepository repo,       // interface, not concrete class
+    IEmailSender     email,      // swappable
+    IPaymentGateway  payment)    // swappable
 {
-    config
-        .ReadFrom.Configuration(ctx.Configuration)
-        .ReadFrom.Services(services)
-        .Enrich.FromLogContext()
-        .WriteTo.Console();
-});
-```
-
-### High-Performance Logging with LoggerMessage
-
-```csharp
-// Source-generated logging (NET 6+) — zero allocation, no boxing
-public static partial class Log
-{
-    [LoggerMessage(Level = LogLevel.Information, Message = "Order {OrderId} placed for {Total:C}")]
-    public static partial void OrderPlaced(ILogger logger, string orderId, decimal total);
-
-    [LoggerMessage(Level = LogLevel.Error, Message = "Failed to process item {ItemId} after {Attempts} attempts")]
-    public static partial void ProcessingFailed(ILogger logger, Exception ex, string itemId, int attempts);
-
-    [LoggerMessage(Level = LogLevel.Debug, Message = "Cache miss for key {Key}")]
-    public static partial void CacheMiss(ILogger logger, string key);
-}
-
-// Usage — zero allocation, no boxing
-Log.OrderPlaced(_logger, orderId, total);
-Log.ProcessingFailed(_logger, ex, itemId, attempts);
-Log.CacheMiss(_logger, cacheKey);
-```
-
-### Log Scopes — Adding Context
-
-```csharp
-// Add contextual properties to all log entries within the scope
-using (_logger.BeginScope(new Dictionary<string, object>
-{
-    ["OrderId"]   = orderId,
-    ["CustomerId"] = customerId,
-    ["RequestId"] = HttpContext.TraceIdentifier
-}))
-{
-    _logger.LogInformation("Starting order processing");
-    await ValidateOrderAsync();
-    await SaveOrderAsync();
-    _logger.LogInformation("Order processing complete");
-    // All log entries above include OrderId, CustomerId, RequestId
+    // Uses what was injected; knows nothing about how to construct them
 }
 ```
 
-### Serilog `appsettings.json` Configuration
+### Service Lifetimes — How Long Each Instance Lives
+
+The most important decision when registering a service is its lifetime.
+Getting this wrong causes bugs that are subtle and environment-specific:
+
+```
+┌─────────────┬─────────────────────────────────────────────┐
+│ Lifetime    │ When created                                 │
+├─────────────┼─────────────────────────────────────────────┤
+│ Transient   │ New instance every time it is resolved       │
+│             │ → Best for lightweight, stateless services   │
+├─────────────┼─────────────────────────────────────────────┤
+│ Scoped      │ Once per scope (per HTTP request in ASP.NET) │
+│             │ → Best for services tied to a request:       │
+│             │   DbContext, CurrentUser, RequestState       │
+├─────────────┼─────────────────────────────────────────────┤
+│ Singleton   │ Once per application lifetime                │
+│             │ → Best for stateless shared services:        │
+│             │   HttpClient, MemoryCache, ILogger           │
+└─────────────┴─────────────────────────────────────────────┘
+```
+
+The **Captive Dependency** bug: injecting a Scoped service into a
+Singleton. The Singleton is created once. The Scoped service it captures
+is the first instance ever created — every request shares the same
+instance, defeating the purpose of Scoped:
+
+```csharp
+// BUG: Singleton captures Scoped — DbContext shared across all requests
+services.AddSingleton<OrderRepository>();   // singleton
+services.AddScoped<AppDbContext>();         // scoped
+
+// OrderRepository is constructed once with one AppDbContext
+// All requests share that DbContext — data leaks between requests!
+
+// FIX: use Scoped for the service too, or inject IServiceScopeFactory
+services.AddScoped<OrderRepository>();     // scoped: new instance per request
+```
+
+### Registering Services
+
+```csharp
+// Worker Service / Console App
+var host = Host.CreateDefaultBuilder(args)
+    .ConfigureServices((ctx, services) =>
+    {
+        // Interface → Implementation binding
+        services.AddTransient<IEmailSender, SmtpEmailSender>();
+        services.AddScoped<IOrderRepository, EfOrderRepository>();
+        services.AddSingleton<ICache, MemoryCache>();
+
+        // Self-binding: useful for classes without interfaces (rare)
+        services.AddScoped<OrderService>();
+
+        // Factory: build the instance yourself
+        services.AddSingleton<IDbConnection>(_ =>
+            new SqliteConnection(ctx.Configuration["Database:ConnectionString"]));
+
+        // Multiple implementations of the same interface
+        // Inject IEnumerable<IPlugin> to get all of them
+        services.AddTransient<IPlugin, PluginA>();
+        services.AddTransient<IPlugin, PluginB>();
+
+        // Options (see §10.2)
+        services.Configure<SmtpOptions>(ctx.Configuration.GetSection("Smtp"));
+    })
+    .Build();
+```
+
+```csharp
+// ASP.NET Core — same API, accessed through WebApplicationBuilder
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddScoped<IOrderRepository, EfOrderRepository>();
+// ...
+var app = builder.Build();
+```
+
+---
+
+## 10.2 The Options Pattern — Strongly-Typed Configuration
+
+Hard-coded configuration strings in services are fragile, undiscoverable,
+and impossible to validate centrally. The Options pattern binds a
+configuration section to a strongly-typed class, validates it at startup,
+and injects it where needed.
+
+```csharp
+// Define the shape of your configuration section
+public record SmtpOptions
+{
+    public required string Host     { get; init; }
+    public required int    Port     { get; init; }
+    public required string From     { get; init; }
+    public bool   UseTls            { get; init; } = true;
+    public string? Username         { get; init; }
+    public string? Password         { get; init; }
+}
+```
 
 ```json
+// appsettings.json
 {
-  "Serilog": {
-    "Using": ["Serilog.Sinks.Console", "Serilog.Sinks.File"],
-    "MinimumLevel": {
-      "Default": "Information",
-      "Override": {
-        "Microsoft": "Warning",
-        "System": "Warning",
-        "Microsoft.EntityFrameworkCore": "Warning"
-      }
-    },
-    "WriteTo": [
-      {
-        "Name": "Console",
-        "Args": {
-          "outputTemplate": "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}"
-        }
-      },
-      {
-        "Name": "File",
-        "Args": {
-          "path": "logs/app-.log",
-          "rollingInterval": "Day",
-          "retainedFileCountLimit": 7
-        }
-      }
-    ],
-    "Enrich": ["FromLogContext", "WithMachineName", "WithThreadId"]
+  "Smtp": {
+    "Host": "smtp.example.com",
+    "Port": 587,
+    "From": "noreply@example.com",
+    "UseTls": true
   }
 }
 ```
 
-> **Rider tip:** *Rider → Settings → Tools → Log Viewer* integrates with local log files. Use *Find Usages* on a logger message string to find all uses of a log message across the codebase.
+```csharp
+// Registration — bind, validate, and fail at startup if invalid
+services.AddOptions<SmtpOptions>()
+    .BindConfiguration("Smtp")           // reads from config["Smtp:*"]
+    .ValidateDataAnnotations()           // honours [Required], [Range]
+    .ValidateOnStart();                  // fail at startup, not first use
 
-> **VS tip:** *View → Output → Debug* shows log output in real time during debugging. *Application Insights* and *Seq* integration available via Azure extensions.
+// Injection: IOptions<T> for static values
+public class EmailService(IOptions<SmtpOptions> opts)
+{
+    private readonly SmtpOptions _smtp = opts.Value;   // access the bound object
 
+    public async Task SendAsync(string to, string subject, CancellationToken ct)
+    {
+        using var client = new SmtpClient(_smtp.Host, _smtp.Port);
+        // ...
+    }
+}
+
+// IOptionsMonitor<T> for values that can change without restart
+// (see Ch 39 for the full explanation)
+public class RateLimitMiddleware(IOptionsMonitor<RateLimitOptions> opts)
+{
+    public async Task InvokeAsync(HttpContext ctx, RequestDelegate next)
+    {
+        var limit = opts.CurrentValue.RequestsPerMinute;  // reads latest value
+        // ...
+    }
+}
+```
+
+---
+
+## 10.3 Configuration — The Full Source Stack
+
+The configuration system stacks providers. Later providers override
+earlier ones. The resulting merged `IConfiguration` is the single source
+of truth for all settings.
+
+```
+Default values in code
+    ↑ override
+appsettings.json
+    ↑ override
+appsettings.{Environment}.json   (e.g., appsettings.Development.json)
+    ↑ override
+User Secrets (only in Development environment)
+    ↑ override
+Environment variables
+    ↑ override
+Command-line arguments           (highest priority — useful for CI)
+```
+
+`Host.CreateDefaultBuilder()` sets up this entire stack automatically.
+The environment (Development, Staging, Production) is controlled by the
+`ASPNETCORE_ENVIRONMENT` or `DOTNET_ENVIRONMENT` variable.
+
+```csharp
+// Manual setup (for console apps without Generic Host)
+var config = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: true)
+    .AddJsonFile($"appsettings.{environment}.json", optional: true)
+    .AddUserSecrets<Program>(optional: true)   // only in Development
+    .AddEnvironmentVariables()
+    .AddCommandLine(args)
+    .Build();
+
+// Reading values
+string? connStr = config["Database:ConnectionString"];  // : = nested section
+string? host    = config.GetSection("Smtp")["Host"];    // section then key
+int port        = config.GetValue<int>("Smtp:Port", 587); // typed with default
+```
+
+### Environment Variables Naming
+
+Environment variables use `__` (double underscore) to represent the `:`
+separator, because `:` is not valid in environment variable names on
+Linux:
+
+```bash
+# This environment variable...
+export Smtp__Host=smtp.example.com
+export Smtp__Port=587
+# ...maps to config["Smtp:Host"] and config["Smtp:Port"]
+```
+
+Chapter 9 covers the full environment variable and secrets story.
+
+---
+
+## 10.4 Logging — Structured and Queryable
+
+Log output is most valuable when it is *structured* — not a plain text
+string, but a record with discrete fields that can be queried, filtered,
+and aggregated. .NET's logging system produces structured logs when
+connected to a structured sink like Serilog or OpenTelemetry.
+
+### The Built-In Logging API
+
+```csharp
+// Inject ILogger<T> — T is the category (usually the containing class)
+public class OrderService(ILogger<OrderService> logger)
+{
+    public async Task<Order> CreateAsync(CreateOrderRequest req, CancellationToken ct)
+    {
+        // Structured log: {OrderId} is a structured field, not a string format
+        logger.LogInformation("Creating order for customer {CustomerId}", req.CustomerId);
+
+        // Use log levels appropriately
+        logger.LogDebug("Validating order details: {@Request}", req);   // Debug: dev-only detail
+        logger.LogInformation("Order {OrderId} created", order.Id);     // Info: important events
+        logger.LogWarning("Order {OrderId} flagged for review", id);    // Warning: unusual
+        logger.LogError(ex, "Failed to process order {OrderId}", id);   // Error: failure with exception
+        logger.LogCritical("Database connection lost — all orders failing"); // Critical: system-wide
+    }
+}
+```
+
+The `{OrderId}` syntax is not string formatting — it is a *message
+template*. The logging framework captures `OrderId` as a structured field
+alongside the message. Tools like Seq, Kibana, or Datadog can then filter
+by `OrderId = "abc123"` across millions of log entries.
+
+### Source-Generated Logging (Performance)
+
+For hot paths, string interpolation in log messages allocates even when
+the log level is not enabled. Source-generated logging avoids this:
+
+```csharp
+// Define once with a source generator attribute
+public static partial class Log
+{
+    [LoggerMessage(Level = LogLevel.Information, Message = "Order {OrderId} created for {CustomerId}")]
+    public static partial void OrderCreated(ILogger logger, Guid orderId, string customerId);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Failed to process payment for order {OrderId}")]
+    public static partial void PaymentFailed(ILogger logger, Exception ex, Guid orderId);
+}
+
+// Usage: no allocation if the log level is not enabled
+Log.OrderCreated(logger, order.Id, order.CustomerId);
+```
+
+### Configuration: Log Levels and Sinks
+
+```json
+// appsettings.json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Warning",                // only Warning and above for everything
+      "Microsoft.AspNetCore": "Warning",   // suppress framework noise
+      "MyApp": "Information",              // more verbose for your own code
+      "MyApp.OrderService": "Debug"        // maximum detail for one service
+    }
+  }
+}
+```
+
+For production, use Serilog with a structured sink:
+
+```bash
+dotnet add package Serilog.AspNetCore
+dotnet add package Serilog.Sinks.Console
+dotnet add package Serilog.Sinks.File
+```
+
+```csharp
+// Program.cs
+builder.Host.UseSerilog((ctx, cfg) =>
+    cfg.ReadFrom.Configuration(ctx.Configuration)  // read Serilog: section
+       .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}")
+       .WriteTo.File("logs/app-.log", rollingInterval: RollingInterval.Day));
+```
+
+---
+
+## 10.5 Connecting DI, Configuration, and Logging to the Rest of the Book
+
+These three form the infrastructure backbone that everything else plugs
+into:
+
+- **Ch 11 (DI Deep Dive)** — every DI concept from §10.1 with complete
+  standalone runnable examples.
+- **Ch 14 (ASP.NET Core)** — the request pipeline is itself DI-driven.
+  Middleware, filters, and controllers are all resolved through the
+  container.
+- **Ch 15 (EF Core)** — `DbContext` is typically registered as Scoped,
+  one per request. `IOptions<T>` carries the connection string.
+- **Ch 17 (Testing)** — tests replace real implementations with fakes
+  using the same DI container that production code uses.
+- **Ch 30 (Observability)** — structured logging integrates with
+  OpenTelemetry for distributed tracing across services.
+- **Ch 39 (Configuration project)** — complete end-to-end examples
+  of configuration in every program type.

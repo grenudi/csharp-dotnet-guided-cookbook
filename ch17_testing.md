@@ -1,401 +1,326 @@
-# Chapter 17 — Testing: xUnit, NSubstitute, Integration & Containers
+# Chapter 17 — Testing: xUnit, NSubstitute, Integration & Testcontainers
 
-## 17.1 Project Setup
+> Code that is not tested is code that works until it does not. Testing
+> is not a separate activity from writing software — it is the practice
+> that tells you whether your software does what you think it does. This
+> chapter covers the .NET testing ecosystem from first principles: why
+> each tool exists, how to structure tests that remain readable and
+> maintainable as the codebase grows, and how to test code that talks
+> to real infrastructure.
 
-```xml
-<!-- tests/MyApp.Tests/MyApp.Tests.csproj -->
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <IsPackable>false</IsPackable>
-    <IsTestProject>true</IsTestProject>
-  </PropertyGroup>
-  <ItemGroup>
-    <!-- xUnit -->
-    <PackageReference Include="xunit" Version="2.9.0" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" PrivateAssets="all" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.0" />
-
-    <!-- Mocking -->
-    <PackageReference Include="NSubstitute" Version="5.1.0" />
-    <PackageReference Include="NSubstitute.Analyzers.CSharp" Version="1.0.17" PrivateAssets="all" />
-
-    <!-- Assertions -->
-    <PackageReference Include="FluentAssertions" Version="6.12.0" />
-
-    <!-- ASP.NET Core integration testing -->
-    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="9.0.0" />
-
-    <!-- Testcontainers -->
-    <PackageReference Include="Testcontainers" Version="4.1.0" />
-    <PackageReference Include="Testcontainers.PostgreSql" Version="4.1.0" />
-
-    <!-- Bogus — fake data -->
-    <PackageReference Include="Bogus" Version="35.5.1" />
-  </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="../../src/MyApp.Api/MyApp.Api.csproj" />
-  </ItemGroup>
-</Project>
-```
-
-### Test Project Structure
-
-```
-tests/MyApp.Tests/
-├── Unit/
-│   ├── Domain/
-│   │   ├── OrderTests.cs
-│   │   └── MoneyTests.cs
-│   ├── Application/
-│   │   ├── PlaceOrderHandlerTests.cs
-│   │   └── GetOrderHandlerTests.cs
-│   └── Infrastructure/
-│       └── SmtpEmailSenderTests.cs
-├── Integration/
-│   ├── Api/
-│   │   ├── OrdersApiTests.cs
-│   │   └── UsersApiTests.cs
-│   └── Database/
-│       └── OrderRepositoryTests.cs
-├── Fixtures/
-│   ├── DatabaseFixture.cs
-│   └── WebAppFixture.cs
-├── Builders/
-│   ├── OrderBuilder.cs
-│   └── UserBuilder.cs
-└── GlobalUsings.cs
-```
+*Building on:* Ch 5 (interfaces — testability depends on abstraction),
+Ch 10–11 (DI — tests replace real services with fakes via the same
+container), Ch 15 (EF Core — Testcontainers gives you real DB tests)
 
 ---
 
-## 17.2 xUnit Basics
+## 17.1 The Testing Pyramid — How Much of Each Kind
 
-```csharp
-// GlobalUsings.cs
-global using Xunit;
-global using NSubstitute;
-global using FluentAssertions;
-global using MyApp.Domain;
+Tests are not interchangeable. They have different costs and different
+assurances. Understanding the trade-off shapes how you structure a test suite:
 
-// Basic test
-public class MoneyTests
-{
-    [Fact]
-    public void Add_SameCurrency_ReturnsSum()
-    {
-        var a = new Money(10m, "EUR");
-        var b = new Money(5m, "EUR");
-
-        var result = a + b;
-
-        result.Amount.Should().Be(15m);
-        result.Currency.Should().Be("EUR");
-    }
-
-    [Fact]
-    public void Add_DifferentCurrency_Throws()
-    {
-        var a = new Money(10m, "EUR");
-        var b = new Money(5m, "USD");
-
-        var act = () => a + b;
-
-        act.Should().Throw<InvalidOperationException>()
-            .WithMessage("*currency*");
-    }
-}
+```
+           ▲  End-to-End / UI Tests
+          ▲▲▲  Slow, expensive, brittle, few
+         ▲▲▲▲▲
+        ▲▲▲▲▲▲▲  Integration Tests
+       ▲▲▲▲▲▲▲▲▲  Test real infrastructure; moderate speed
+      ▲▲▲▲▲▲▲▲▲▲▲
+     ▲▲▲▲▲▲▲▲▲▲▲▲▲
+    ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲  Unit Tests
+   ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲  Fast, isolated, many, cheap to maintain
 ```
 
-### Theory — Parameterized Tests
+- **Unit tests** — test one class or function in isolation. All
+  dependencies are replaced with test doubles. Fast (milliseconds),
+  deterministic, run on every save.
+- **Integration tests** — test the collaboration between real components:
+  an API endpoint talking to a real database, a background service
+  processing real messages. Slower, but test what actually matters in
+  production.
+- **End-to-end tests** — drive the real UI or real system. Slow, brittle,
+  expensive. Reserve for critical user journeys only.
 
-```csharp
-public class GradeCalculatorTests
-{
-    [Theory]
-    [InlineData(95, "A")]
-    [InlineData(85, "B")]
-    [InlineData(75, "C")]
-    [InlineData(65, "D")]
-    [InlineData(55, "F")]
-    public void GetGrade_ReturnsExpected(int score, string expected)
-    {
-        var grade = GradeCalculator.GetGrade(score);
-        grade.Should().Be(expected);
-    }
-
-    // MemberData — data from a static property/method
-    [Theory]
-    [MemberData(nameof(InvalidScores))]
-    public void GetGrade_InvalidScore_Throws(int score)
-    {
-        var act = () => GradeCalculator.GetGrade(score);
-        act.Should().Throw<ArgumentOutOfRangeException>();
-    }
-
-    public static IEnumerable<object[]> InvalidScores => new[]
-    {
-        new object[] { -1 },
-        new object[] { 101 },
-        new object[] { int.MinValue },
-    };
-
-    // ClassData — data from a class (useful for complex types)
-    [Theory]
-    [ClassData(typeof(OrderTestData))]
-    public void ProcessOrder_Works(Order order, decimal expectedTotal)
-    {
-        var result = OrderProcessor.Calculate(order);
-        result.Total.Should().Be(expectedTotal);
-    }
-}
-
-public class OrderTestData : TheoryData<Order, decimal>
-{
-    public OrderTestData()
-    {
-        Add(OrderBuilder.Simple(), 9.99m);
-        Add(OrderBuilder.WithDiscount(0.1m), 8.99m);
-        Add(OrderBuilder.Bulk(qty: 10), 99.90m);
-    }
-}
-```
+Most teams maintain a large base of unit tests and a smaller but critical
+set of integration tests. The goal is confidence at speed.
 
 ---
 
-## 17.3 Fixtures and Shared State
+## 17.2 Setting Up xUnit
+
+xUnit is the standard test framework for .NET. It uses attributes to
+mark test methods and constructor/`IAsyncLifetime` for setup and teardown.
+Unlike NUnit or MSTest, xUnit creates a new test class instance per test —
+this enforces test isolation by design.
+
+```bash
+dotnet new xunit -n MyApp.Tests
+dotnet add package FluentAssertions
+dotnet add package NSubstitute
+dotnet add package Microsoft.AspNetCore.Mvc.Testing
+dotnet add package Testcontainers.PostgreSql
+```
 
 ```csharp
-// Shared fixture — setup once per test class
-public class OrderServiceFixture : IDisposable
+public class OrderServiceTests
 {
-    public IOrderRepository Repository { get; }
-    public IEmailSender EmailSender { get; }
-    public OrderService Service { get; }
+    // xUnit runs the constructor for each test — fresh state every time
+    // No [SetUp] method needed — just the constructor
+    private readonly FakeEmailSender _email;
+    private readonly IOrderRepository _repo;
+    private readonly OrderService _sut;  // System Under Test
 
-    public OrderServiceFixture()
+    public OrderServiceTests()
     {
-        Repository  = Substitute.For<IOrderRepository>();
-        EmailSender = Substitute.For<IEmailSender>();
-        Service     = new OrderService(Repository, EmailSender, NullLogger<OrderService>.Instance);
+        _email = new FakeEmailSender();
+        _repo  = Substitute.For<IOrderRepository>();   // NSubstitute mock
+        _sut   = new OrderService(_repo, _email);
     }
-
-    public void Dispose() { /* cleanup */ }
-}
-
-// Use fixture
-public class OrderServiceTests : IClassFixture<OrderServiceFixture>
-{
-    private readonly OrderServiceFixture _fix;
-    public OrderServiceTests(OrderServiceFixture fix) => _fix = fix;
 
     [Fact]
-    public async Task PlaceOrder_ValidOrder_SavesAndSendsEmail()
+    public async Task CreateOrder_saves_order_and_sends_confirmation()
     {
-        var order = new Order { CustomerId = "C1", Lines = [new OrderLine("SKU-1", 2, 9.99m)] };
+        // Arrange
+        var request = new CreateOrderRequest("C001", [new("PROD01", 2)]);
 
-        await _fix.Service.PlaceOrderAsync(order);
+        // Act
+        var order = await _sut.CreateAsync(request, CancellationToken.None);
 
-        await _fix.Repository.Received(1).AddAsync(Arg.Is<Order>(o => o.CustomerId == "C1"), Arg.Any<CancellationToken>());
-        await _fix.EmailSender.Received(1).SendAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+        // Assert
+        await _repo.Received(1).AddAsync(Arg.Any<Order>(), Arg.Any<CancellationToken>());
+        Assert.Single(_email.SentEmails);
+        _email.SentEmails[0].To.Should().Be("C001");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData(null)]
+    public async Task CreateOrder_with_invalid_customerId_throws(string? customerId)
+    {
+        var request = new CreateOrderRequest(customerId!, []);
+        await Assert.ThrowsAsync<ValidationException>(
+            () => _sut.CreateAsync(request, CancellationToken.None));
+    }
+}
+```
+
+### Fact vs Theory
+
+- `[Fact]` — one test with no parameters.
+- `[Theory]` with `[InlineData]`, `[MemberData]`, or `[ClassData]` —
+  the same test run with multiple sets of inputs. Each combination
+  appears as a separate test in the runner.
+
+---
+
+## 17.3 Test Fixtures — Sharing Expensive Setup
+
+Creating a database connection or starting a container for every test is
+slow. xUnit's `IClassFixture<T>` shares one fixture instance across all
+tests in a class, while still creating a new test instance per test:
+
+```csharp
+// Fixture: expensive resource shared across all tests in the class
+public class DatabaseFixture : IAsyncLifetime
+{
+    public AppDbContext Db { get; private set; } = null!;
+    private ServiceProvider _provider = null!;
+
+    public async Task InitializeAsync()
+    {
+        var services = new ServiceCollection();
+        services.AddDbContext<AppDbContext>(o =>
+            o.UseInMemoryDatabase("test-" + Guid.NewGuid()));  // fresh DB per fixture
+        _provider = services.BuildServiceProvider();
+        Db = _provider.GetRequiredService<AppDbContext>();
+        await Db.Database.EnsureCreatedAsync();
+    }
+
+    public async Task DisposeAsync()
+    {
+        await Db.DisposeAsync();
+        await _provider.DisposeAsync();
     }
 }
 
-// Collection fixture — shared across multiple test classes
-[CollectionDefinition("Database")]
-public class DatabaseCollection : ICollectionFixture<DatabaseFixture> { }
-
-[Collection("Database")]
-public class UserRepositoryTests
+// The test class receives the fixture via constructor injection
+public class OrderRepositoryTests(DatabaseFixture fixture)
+    : IClassFixture<DatabaseFixture>
 {
-    private readonly DatabaseFixture _db;
-    public UserRepositoryTests(DatabaseFixture db) => _db = db;
-    // ...
+    [Fact]
+    public async Task GetByCustomer_returns_only_that_customers_orders()
+    {
+        fixture.Db.Orders.AddRange(
+            new Order { CustomerId = "C001", Total = 10 },
+            new Order { CustomerId = "C002", Total = 20 });
+        await fixture.Db.SaveChangesAsync();
+
+        var results = await new OrderRepository(fixture.Db)
+            .GetByCustomerAsync("C001", CancellationToken.None);
+
+        results.Should().HaveCount(1).And.OnlyContain(o => o.CustomerId == "C001");
+    }
 }
 ```
 
 ---
 
-## 17.4 NSubstitute — Mocking
+## 17.4 NSubstitute — Creating Test Doubles
+
+A test double stands in for a real dependency during testing. NSubstitute
+creates doubles (mocks) that let you control what they return and verify
+how they were called:
 
 ```csharp
-// Create substitute (mock)
+// Create a substitute for any interface or virtual class
 var repo = Substitute.For<IOrderRepository>();
 
-// Setup return value
-repo.GetByIdAsync(1, Arg.Any<CancellationToken>())
-    .Returns(new Order { Id = 1, CustomerId = "C1" });
-
-// Setup with dynamic return
+// Configure return values
 repo.GetByIdAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
-    .Returns(callInfo =>
-    {
-        var id = callInfo.ArgAt<int>(0);
-        return id > 0 ? new Order { Id = id } : null;
-    });
+    .Returns(new Order { Id = 1, CustomerId = "C001" });
 
-// Setup to throw
+// Configure exceptions
 repo.AddAsync(Arg.Any<Order>(), Arg.Any<CancellationToken>())
-    .ThrowsAsync(new DbUpdateException("Connection failed"));
+    .ThrowsAsync(new DbException("Connection lost"));
 
 // Verify calls
-await repo.Received(1).GetByIdAsync(1, Arg.Any<CancellationToken>());
-await repo.DidNotReceive().DeleteAsync(Arg.Any<int>(), Arg.Any<CancellationToken>());
-
-// Verify with argument capture
-await repo.Received().AddAsync(
-    Arg.Is<Order>(o => o.CustomerId == "C1" && o.Lines.Count > 0),
+await repo.Received(1).AddAsync(
+    Arg.Is<Order>(o => o.CustomerId == "C001"),
     Arg.Any<CancellationToken>());
 
-// Partial substitute (for abstract classes)
-var service = Substitute.ForPartsOf<BaseService>();
-service.WhenForAnyArgs(s => s.VirtualMethod()).DoNotCallBase();
+await repo.DidNotReceive().DeleteAsync(Arg.Any<int>(), Arg.Any<CancellationToken>());
 
-// Multiple interfaces
-var multi = Substitute.For<IFoo, IBar, IDisposable>();
+// Capture arguments
+Order? captured = null;
+await repo.AddAsync(Arg.Do<Order>(o => captured = o), Arg.Any<CancellationToken>());
+// ... call the code under test ...
+Assert.Equal("C001", captured?.CustomerId);
+```
 
-// Setup property
-var config = Substitute.For<IConfiguration>();
-config["MyKey"].Returns("MyValue");
+### When to Use Mocks vs Fakes
+
+- **Mock** (NSubstitute): when you need to verify *that* something was
+  called, or set up specific return values per test.
+- **Fake** (hand-written): when the mock setup would be more complex
+  than a real simple implementation. A `FakeEmailSender` that collects
+  sent emails in a list is often clearer than elaborate NSubstitute setup.
+
+```csharp
+// A hand-written fake: simple, readable, reusable
+public class FakeEmailSender : IEmailSender
+{
+    public record SentEmail(string To, string Subject, string Body);
+    public List<SentEmail> SentEmails { get; } = [];
+
+    public Task SendAsync(string to, string subject, string body, CancellationToken ct)
+    {
+        SentEmails.Add(new(to, subject, body));
+        return Task.CompletedTask;
+    }
+}
 ```
 
 ---
 
-## 17.5 FluentAssertions
+## 17.5 FluentAssertions — Readable Assertions
+
+FluentAssertions provides a fluent, readable assertion API:
 
 ```csharp
-// Basic
+// Primitive values
 result.Should().Be(42);
-result.Should().NotBe(0);
-result.Should().BeGreaterThan(0).And.BeLessThan(100);
-result.Should().BeInRange(1, 100);
-
-// Strings
-name.Should().Be("Alice");
-name.Should().StartWith("Al");
-name.Should().Contain("lic");
-name.Should().MatchRegex(@"^[A-Z][a-z]+$");
-name.Should().HaveLength(5);
-name.Should().BeNullOrEmpty();
-name.Should().NotBeNullOrWhiteSpace();
+result.Should().BeGreaterThan(0);
+text.Should().StartWith("Hello").And.EndWith("World").And.HaveLength(11);
 
 // Collections
 list.Should().HaveCount(3);
-list.Should().Contain(42);
-list.Should().ContainInOrder(1, 2, 3);
-list.Should().OnlyContain(x => x > 0);
-list.Should().BeEquivalentTo(expected); // deep equality, order-independent
-list.Should().BeInAscendingOrder();
-list.Should().NotContainNulls();
-list.Should().HaveCountGreaterThan(0);
+list.Should().Contain(item => item.Id == 1);
+list.Should().BeInAscendingOrder(x => x.Name);
+list.Should().OnlyContain(x => x.IsActive);
+list.Should().BeEmpty();
 
 // Objects
-user.Should().BeEquivalentTo(expectedUser, opts =>
-    opts.Excluding(u => u.CreatedAt)
-        .Excluding(u => u.Id));
+order.Should().BeEquivalentTo(expected,      // deep equality
+    opts => opts.Excluding(o => o.CreatedAt)); // exclude timestamps
 
 // Exceptions
-var act = async () => await service.DoRiskyAsync();
-await act.Should().ThrowAsync<InvalidOperationException>()
-    .WithMessage("*order*")
-    .Where(ex => ex.InnerException is null);
-
-act.Should().NotThrow();
+var act = () => service.ProcessAsync(null!, ct);
+await act.Should().ThrowAsync<ArgumentNullException>()
+    .WithMessage("*request*");
 
 // Nullable
-result.Should().NotBeNull();
-result.Should().BeNull();
-
-// Numeric precision
-3.14159.Should().BeApproximately(Math.PI, precision: 0.0001);
+value.Should().NotBeNull();
+value.Should().BeNull();
 ```
+
+The error messages from FluentAssertions are far more informative than
+`Assert.Equal` — they show the actual and expected values in context.
 
 ---
 
-## 17.6 Integration Testing with WebApplicationFactory
+## 17.6 Integration Testing with `WebApplicationFactory`
+
+`WebApplicationFactory<T>` boots your entire ASP.NET Core application in
+memory — with its real `Program.cs`, real middleware pipeline, and real
+DI container — and gives you an `HttpClient` to talk to it. You can
+replace specific services (like external APIs) with fakes.
 
 ```csharp
-// Fixture
-public class WebAppFixture : WebApplicationFactory<Program>
+public class OrderApiTests(OrderApiFactory factory)
+    : IClassFixture<OrderApiFactory>
 {
-    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    [Fact]
+    public async Task POST_orders_creates_order_and_returns_201()
     {
-        builder.ConfigureServices(services =>
+        var client = factory.CreateClient();
+        // Authenticate if needed
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", factory.GenerateTestToken("user-1"));
+
+        var response = await client.PostAsJsonAsync("/api/orders", new
         {
-            // Replace real DB with in-memory SQLite
-            var descriptor = services.SingleOrDefault(d =>
-                d.ServiceType == typeof(DbContextOptions<AppDbContext>));
-            if (descriptor is not null) services.Remove(descriptor);
-
-            services.AddDbContext<AppDbContext>(opt =>
-                opt.UseSqlite($"Data Source=test_{Guid.NewGuid():N}.db"));
-
-            // Seed test data
-            var sp = services.BuildServiceProvider();
-            using var scope = sp.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            db.Database.EnsureCreated();
-            SeedDatabase(db);
+            CustomerId = "C001",
+            Items = new[] { new { ProductId = "P01", Quantity = 2 } }
         });
 
-        builder.UseEnvironment("Testing");
-    }
-
-    private static void SeedDatabase(AppDbContext db)
-    {
-        db.Users.AddRange(
-            new User { Id = 1, Name = "Alice", Email = "alice@test.com" },
-            new User { Id = 2, Name = "Bob",   Email = "bob@test.com" });
-        db.SaveChanges();
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        var created = await response.Content.ReadFromJsonAsync<OrderResponse>();
+        created!.CustomerId.Should().Be("C001");
     }
 }
 
-// Test class
-[Collection("WebApp")]
-public class UsersApiTests : IClassFixture<WebAppFixture>
+// Factory: customise the DI container for tests
+public class OrderApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
-    private readonly HttpClient _client;
+    private PostgreSqlContainer _db = null!;
 
-    public UsersApiTests(WebAppFixture factory)
+    public async Task InitializeAsync()
     {
-        _client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        _db = new PostgreSqlBuilder().WithImage("postgres:16-alpine").Build();
+        await _db.StartAsync();
+    }
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureTestServices(services =>
         {
-            AllowAutoRedirect = false
+            // Replace the real DB with a test DB
+            services.RemoveAll<DbContextOptions<AppDbContext>>();
+            services.AddDbContext<AppDbContext>(o =>
+                o.UseNpgsql(_db.GetConnectionString()));
+
+            // Replace the real email sender with a fake
+            services.RemoveAll<IEmailSender>();
+            services.AddSingleton<IEmailSender, FakeEmailSender>();
         });
     }
 
-    [Fact]
-    public async Task GetUser_ExistingId_ReturnsUser()
-    {
-        var response = await _client.GetAsync("/api/users/1");
+    public string GenerateTestToken(string userId) =>
+        // ... generate a valid JWT for tests
+        JwtTestHelper.Generate(userId);
 
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-        var user = await response.Content.ReadFromJsonAsync<UserDto>();
-        user.Should().NotBeNull();
-        user!.Name.Should().Be("Alice");
-    }
-
-    [Fact]
-    public async Task CreateUser_ValidData_ReturnsCreated()
-    {
-        var newUser = new CreateUserRequest { Name = "Charlie", Email = "charlie@test.com" };
-
-        var response = await _client.PostAsJsonAsync("/api/users", newUser);
-
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
-        var created = await response.Content.ReadFromJsonAsync<UserDto>();
-        created!.Id.Should().BeGreaterThan(0);
-        created.Name.Should().Be("Charlie");
-    }
-
-    [Fact]
-    public async Task GetUser_NonExistentId_ReturnsNotFound()
-    {
-        var response = await _client.GetAsync("/api/users/9999");
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
-    }
+    public async Task DisposeAsync() => await _db.DisposeAsync();
 }
 ```
 
@@ -403,153 +328,129 @@ public class UsersApiTests : IClassFixture<WebAppFixture>
 
 ## 17.7 Testcontainers — Real Database Tests
 
-```csharp
-// DatabaseFixture.cs — starts a real PostgreSQL container
-public class DatabaseFixture : IAsyncLifetime
-{
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()
-        .WithImage("postgres:16")
-        .WithDatabase("testdb")
-        .WithUsername("postgres")
-        .WithPassword("password")
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(5432))
-        .Build();
+In-memory databases (like EF Core's InMemory provider) do not enforce
+foreign keys, unique constraints, or null constraints. Your tests can
+pass while your production query fails. Testcontainers starts a real
+database in Docker for your tests and tears it down after:
 
-    public AppDbContext Db { get; private set; } = null!;
+```bash
+dotnet add package Testcontainers.PostgreSql
+# or
+dotnet add package Testcontainers.MsSql
+dotnet add package Testcontainers.MySql
+```
+
+```csharp
+public class OrderRepositoryIntegrationTests : IAsyncLifetime
+{
+    private PostgreSqlContainer _pg = null!;
+    private AppDbContext _db = null!;
 
     public async Task InitializeAsync()
     {
-        await _container.StartAsync();
+        _pg = new PostgreSqlBuilder()
+            .WithImage("postgres:16-alpine")
+            .WithDatabase("testdb")
+            .Build();
 
-        var opts = new DbContextOptionsBuilder<AppDbContext>()
-            .UseNpgsql(_container.GetConnectionString())
+        await _pg.StartAsync();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseNpgsql(_pg.GetConnectionString())
             .Options;
 
-        Db = new AppDbContext(opts);
-        await Db.Database.MigrateAsync();
+        _db = new AppDbContext(options);
+        await _db.Database.MigrateAsync();  // run real migrations
+    }
+
+    [Fact]
+    public async Task GetByStatus_returns_matching_orders_from_real_db()
+    {
+        _db.Orders.AddRange(
+            new Order { Status = OrderStatus.Pending,    CustomerId = "C1" },
+            new Order { Status = OrderStatus.Processing, CustomerId = "C2" },
+            new Order { Status = OrderStatus.Pending,    CustomerId = "C3" });
+        await _db.SaveChangesAsync();
+
+        var repo    = new OrderRepository(_db);
+        var pending = await repo.GetByStatusAsync(OrderStatus.Pending, default);
+
+        pending.Should().HaveCount(2)
+               .And.OnlyContain(o => o.Status == OrderStatus.Pending);
     }
 
     public async Task DisposeAsync()
     {
-        await Db.DisposeAsync();
-        await _container.DisposeAsync();
-    }
-}
-
-// Test using real PostgreSQL
-[Collection("Database")]
-public class OrderRepositoryTests
-{
-    private readonly DatabaseFixture _db;
-
-    public OrderRepositoryTests(DatabaseFixture db) => _db = db;
-
-    [Fact]
-    public async Task AddOrder_Persists()
-    {
-        var repo = new SqlOrderRepository(_db.Db);
-        var order = new Order
-        {
-            UserId = 1,
-            Total = 49.99m,
-            Lines = [new OrderLine { Sku = "SKU-1", Quantity = 1, UnitPrice = 49.99m }]
-        };
-
-        var id = await repo.AddAsync(order, TestContext.Current.CancellationToken);
-
-        var saved = await repo.GetByIdAsync(id, TestContext.Current.CancellationToken);
-        saved.Should().NotBeNull();
-        saved!.Total.Should().Be(49.99m);
-        saved.Lines.Should().HaveCount(1);
+        await _db.DisposeAsync();
+        await _pg.DisposeAsync();
     }
 }
 ```
 
+Testcontainers images are cached — the first run pulls the image, subsequent
+runs start in seconds. For CI/CD, ensure Docker is available on the build
+agent.
+
 ---
 
-## 17.8 Test Builders (Fake Data)
+## 17.8 Test Builders — Constructing Complex Test Data
+
+When entities have many required properties, constructing them in every
+test is verbose and fragile — changing the entity's constructor breaks
+every test. A Builder (or AutoFaker) provides sensible defaults that
+individual tests override only for what matters:
 
 ```csharp
-// Using Bogus for realistic fake data
-using Bogus;
-
-public static class Fakers
-{
-    public static readonly Faker<User> UserFaker = new Faker<User>()
-        .RuleFor(u => u.Name, f => f.Name.FullName())
-        .RuleFor(u => u.Email, (f, u) => f.Internet.Email(u.Name))
-        .RuleFor(u => u.CreatedAt, f => f.Date.Past(2));
-
-    public static readonly Faker<Order> OrderFaker = new Faker<Order>()
-        .RuleFor(o => o.Status, f => f.PickRandom("Pending", "Shipped", "Delivered"))
-        .RuleFor(o => o.Total, f => f.Finance.Amount(5, 500))
-        .RuleFor(o => o.PlacedAt, f => f.Date.Recent(30));
-}
-
-// Builder pattern
+// Builder pattern for test data
 public class OrderBuilder
 {
-    private string _customerId = "C1";
-    private decimal _total = 9.99m;
-    private List<OrderLine> _lines = new();
-    private string _status = "Pending";
+    private string _customerId = "test-customer";
+    private OrderStatus _status = OrderStatus.Pending;
+    private decimal _total = 100m;
+    private List<OrderLine> _lines = [new("PROD01", 1, 100m)];
 
-    public static OrderBuilder Default() => new OrderBuilder()
-        .WithLine("SKU-1", 1, 9.99m);
-
-    public OrderBuilder ForCustomer(string id) { _customerId = id; return this; }
+    public OrderBuilder WithCustomer(string id) { _customerId = id; return this; }
+    public OrderBuilder WithStatus(OrderStatus s) { _status = s; return this; }
     public OrderBuilder WithTotal(decimal t) { _total = t; return this; }
-    public OrderBuilder WithStatus(string s) { _status = s; return this; }
-
-    public OrderBuilder WithLine(string sku, int qty, decimal price)
-    {
-        _lines.Add(new OrderLine { Sku = sku, Quantity = qty, UnitPrice = price });
-        return this;
-    }
 
     public Order Build() => new Order
     {
         CustomerId = _customerId,
-        Total = _total,
-        Status = _status,
-        Lines = _lines,
+        Status     = _status,
+        Total      = _total,
+        Lines      = _lines,
+        CreatedAt  = DateTime.UtcNow,
     };
 }
 
-// Usage
-var order = OrderBuilder.Default()
-    .ForCustomer("C42")
-    .WithLine("SKU-2", 3, 14.99m)
-    .Build();
+// Tests only set what matters for that specific test
+[Fact]
+public async Task HighValueOrders_get_flagged_for_review()
+{
+    var order = new OrderBuilder().WithTotal(5000m).Build();
+    // ...
+}
+
+[Fact]
+public async Task CancelledOrders_cannot_be_updated()
+{
+    var order = new OrderBuilder().WithStatus(OrderStatus.Cancelled).Build();
+    // ...
+}
 ```
 
 ---
 
-## 17.9 Code Coverage
+## 17.9 Connecting Testing to the Rest of the Book
 
-```bash
-# Run with coverage
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
-
-# Generate HTML report (install reportgenerator)
-dotnet tool install --global dotnet-reportgenerator-globaltool
-
-reportgenerator \
-    -reports:./coverage/**/coverage.cobertura.xml \
-    -targetdir:./coverage/report \
-    -reporttypes:HtmlInline_AzurePipelines
-
-open ./coverage/report/index.html
-```
-
-```xml
-<!-- Add to test .csproj for threshold enforcement -->
-<ItemGroup>
-  <PackageReference Include="coverlet.collector" Version="6.0.2" PrivateAssets="all" />
-</ItemGroup>
-```
-
-> **Rider tip:** Rider has built-in code coverage (`Run → Cover`). After running, it highlights covered/uncovered lines directly in the editor with green/red/yellow gutters. No separate tool needed.
-
-> **VS tip:** *Test → Analyze Code Coverage for All Tests* generates a coverage report. The Enterprise edition shows per-line coverage highlighting. The *Fine Code Coverage* extension adds this to Community/Pro editions for free.
-
+- **Ch 5 (OOP)** — interfaces are what make unit testing possible.
+  A service that depends on `IEmailSender` can be tested with a fake;
+  one that newed up `SmtpEmailSender` directly cannot.
+- **Ch 11 (DI)** — tests use the same DI container as production.
+  `WebApplicationFactory.ConfigureTestServices` replaces specific
+  registrations while keeping everything else real.
+- **Ch 15 (EF Core)** — Testcontainers is the right tool for EF Core
+  tests. In-memory providers hide real constraint and migration bugs.
+- **Ch 18 (Architectures)** — clean architecture with a domain layer
+  makes unit tests fast and numerous; the domain has no infrastructure
+  dependencies to mock.

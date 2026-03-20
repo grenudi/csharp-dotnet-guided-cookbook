@@ -1,546 +1,513 @@
 # Chapter 8 — Async/Await & Concurrency
 
-## 8.1 The Async/Await Mental Model
+> I/O is slow. A disk read takes microseconds; a network call takes
+> milliseconds; a database query takes tens of milliseconds. A CPU
+> instruction takes nanoseconds. If your thread waits for each I/O
+> operation to complete before moving on, you waste the CPU for the
+> entire duration of every wait. Async/await is .NET's answer to this
+> problem — and it is one of the most consequential features in the
+> language for real-world application performance.
 
-Async/await is **not threading** — it is cooperative multitasking. `await` yields the current thread to do other work while an I/O operation completes, then resumes on a (possibly different) thread.
-
-```
-Thread 1 calls GetDataAsync()
-    │
-    ├── await httpClient.GetAsync(...)
-    │       │
-    │       └── Thread 1 is RELEASED back to thread pool
-    │              (can serve other requests here)
-    │
-    └── I/O completes (kernel notifies IOCP)
-           │
-           └── Thread 2 (or Thread 1 again) picks up the continuation
-                  │
-                  └── Code after await runs
-```
+*Building on:* Ch 2 (generics, nullable), Ch 4 (delegates, lambdas),
+Ch 7 (IEnumerable, which async extends into IAsyncEnumerable)
 
 ---
 
-## 8.2 Task, Task\<T\>, and ValueTask\<T\>
+## 8.1 The Mental Model — What `await` Actually Does
+
+`async`/`await` is **not threading**. This is the most common misconception.
+Adding `async` to a method does not create a new thread. Instead, it
+implements *cooperative multitasking*: when the program reaches an
+`await`, it says "I have nothing useful to do right now while this I/O
+operation completes — let someone else use this thread". When the I/O
+finishes, the continuation (the code after `await`) is scheduled to run.
+
+The thread is *released* during the wait and is free to handle other
+work — other HTTP requests, other operations, other completions. On a web
+server, this is what allows a single server to handle thousands of
+concurrent requests with a small thread pool.
+
+```
+Thread 1 calls GetUserAsync()
+    │
+    ├── await httpClient.GetAsync(...)   ← Thread 1 is RELEASED here
+    │         │                            It goes back to the pool.
+    │         │                            Other requests use it.
+    │         │
+    │         └── Network I/O completes (OS notifies IOCP)
+    │                   │
+    │                   └── Thread 2 (or Thread 1 again) picks up the continuation
+    │                             │
+    │                             └── Code after await runs here
+    │
+    └── Returns to caller with the result
+```
+
+The key insight: during `await`, *no thread is blocked*. The thread is
+not sitting idle doing nothing — it is returned to the pool and serves
+other work. This is fundamentally different from a synchronous call where
+the thread is frozen for the duration.
+
+---
+
+## 8.2 `Task`, `Task<T>`, and `ValueTask<T>` — The Return Types
+
+When a method is declared `async`, it must return one of these types.
+Each represents an in-progress operation that will eventually complete.
+
+### `Task` — An Async Void
+
+`Task` represents an operation that produces no value but may succeed or
+fail. It is the async equivalent of `void`:
 
 ```csharp
-// Task — represents a void async operation
-public async Task DoWorkAsync(CancellationToken ct = default)
+// Caller can await this to wait for completion and observe exceptions
+public async Task SaveChangesAsync(CancellationToken ct)
 {
-    await Task.Delay(1000, ct);
-    Console.WriteLine("Done");
+    await _db.SaveChangesAsync(ct);
+    _logger.LogInformation("Changes saved");
+    // No return value, but exceptions will propagate to the awaiter
 }
-
-// Task<T> — represents an async operation that returns a value
-public async Task<int> ComputeAsync()
-{
-    await Task.Delay(100);
-    return 42;
-}
-
-// ValueTask<T> — for hot paths that often complete synchronously
-// Use when: frequently called, often returns cached result
-public async ValueTask<string> GetCachedAsync(string key)
-{
-    if (_cache.TryGetValue(key, out var val))
-        return val;  // no allocation! returns immediately
-
-    var result = await FetchFromDatabaseAsync(key);
-    _cache[key] = result;
-    return result;
-}
-
-// ValueTask — avoid awaiting more than once, avoid storing
-// BAD:
-var vt = GetCachedAsync("key");
-var r1 = await vt;
-var r2 = await vt; // undefined behavior!
-
-// GOOD — await immediately or convert
-var result = await GetCachedAsync("key");
-// Or:
-var vt2 = GetCachedAsync("key");
-if (!vt2.IsCompleted) await vt2.AsTask(); // convert when needed
 ```
+
+### `Task<T>` — An Async Value
+
+`Task<T>` represents an operation that will eventually produce a value
+of type `T`. This is the most common async return type:
+
+```csharp
+public async Task<User> GetUserAsync(int id, CancellationToken ct)
+{
+    var user = await _db.Users.FindAsync(id, ct);
+    return user ?? throw new UserNotFoundException(id);
+    // The Task<User> holds this User value when the Task completes
+}
+
+// Caller awaits to get the value
+User user = await GetUserAsync(42, ct);
+```
+
+### `ValueTask<T>` — For Hot Paths That Are Often Synchronous
+
+`Task<T>` always allocates a heap object. For methods that are very
+frequently called and often return a cached result synchronously, this
+allocation is measurable overhead. `ValueTask<T>` avoids the allocation
+when the result is immediately available:
+
+```csharp
+private readonly Dictionary<string, User> _cache = new();
+
+public async ValueTask<User?> GetCachedUserAsync(string id, CancellationToken ct)
+{
+    // If the result is cached, return without any heap allocation
+    if (_cache.TryGetValue(id, out var cached))
+        return cached;   // ValueTask wraps the value directly — no Task allocated
+
+    // Only when we actually go async do we pay the Task cost
+    var user = await _db.Users.FindAsync(id, ct);
+    if (user is not null)
+        _cache[id] = user;
+    return user;
+}
+```
+
+**Rule:** Use `ValueTask<T>` only in performance-sensitive code where
+profiling shows Task allocation is a bottleneck. Misuse causes subtle
+bugs: a `ValueTask` must be awaited exactly once, cannot be awaited after
+it has completed, and should not be stored in a field.
 
 ---
 
 ## 8.3 Writing Correct Async Code
 
-### The Three Golden Rules
+### The Four Rules
+
+**Rule 1: async all the way down.**
+If a method calls an async method, it should itself be async. Mixing
+sync and async is where deadlocks live:
 
 ```csharp
-// 1. Async all the way — don't mix sync and async
-// BAD — deadlock risk in non-ASP.NET contexts with SynchronizationContext:
-public string GetData() => GetDataAsync().Result; // .Wait() / .Result = deadlock!
+// WRONG: .Result blocks the current thread, holding the SynchronizationContext
+// Under ASP.NET Core this doesn't deadlock but in WinForms/WPF it will
+public User GetUser(int id) =>
+    GetUserAsync(id).Result;   // blocks current thread
 
-// GOOD — make the caller async too
-public async Task<string> GetDataAsync()
+// CORRECT: await all the way up
+public async Task<User> GetUserAsync(int id) =>
+    await _service.FetchUserAsync(id);
+```
+
+**Rule 2: always pass `CancellationToken`.**
+Operations that can be cancelled must accept a `CancellationToken` and
+pass it to every async call they make. Without it, a user cancellation
+(navigating away, closing the app) leaves the work running until it
+finishes naturally:
+
+```csharp
+// WRONG: user cancels, but the operation runs to completion
+public async Task<Report> GenerateReportAsync()
 {
-    return await FetchAsync();
+    var data    = await FetchDataAsync();          // ignores cancellation
+    var analysed = await AnalyseAsync(data);       // ignores cancellation
+    return await FormatAsync(analysed);            // ignores cancellation
 }
 
-// 2. ConfigureAwait(false) in library code
-// Libraries don't need to resume on the original context
-public async Task<byte[]> DownloadAsync(string url)
+// CORRECT: cancellation propagates through the entire call chain
+public async Task<Report> GenerateReportAsync(CancellationToken ct = default)
 {
-    using var client = new HttpClient();
-    // ConfigureAwait(false): don't capture SynchronizationContext
-    var response = await client.GetAsync(url).ConfigureAwait(false);
-    return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-}
-// In ASP.NET Core there's no SynchronizationContext, so ConfigureAwait is less critical
-// but still a good habit in library code.
-
-// 3. Always pass CancellationToken
-public async Task<User?> GetUserAsync(int id, CancellationToken ct = default)
-{
-    return await _db.Users.FindAsync([id], ct).ConfigureAwait(false);
+    var data     = await FetchDataAsync(ct);
+    var analysed = await AnalyseAsync(data, ct);
+    return await FormatAsync(analysed, ct);
 }
 ```
 
-### Async State Machine Optimization
+**Rule 3: never use `async void` except for event handlers.**
+`async void` methods cannot be awaited, and any exception thrown inside
+them crashes the process immediately (it goes to the unhandled exception
+handler with no chance to catch it). The only legitimate use is in event
+handlers where the signature is fixed:
 
 ```csharp
-// If no actual await (or only in rare paths), avoid state machine overhead:
-public Task<int> GetCountAsync()
-{
-    if (_count > 0) return Task.FromResult(_count); // no state machine!
-    return GetCountFromDbAsync();
-}
+// WRONG: exceptions vanish or crash the process
+async void LoadDataBadly() => await FetchDataAsync();
 
-// ValueTask eliminates allocation for sync-fast path:
-public ValueTask<int> GetCountValueAsync()
-{
-    if (_count > 0) return ValueTask.FromResult(_count);
-    return new ValueTask<int>(GetCountFromDbAsync());
-}
+// CORRECT: return Task so the caller can await and handle exceptions
+async Task LoadDataAsync() => await FetchDataAsync();
 
-// Async method with no await — returns completed task
-public async Task<int> GetZeroAsync()
+// Exception for event handlers — the signature is fixed by the framework
+button.Click += async (sender, e) =>
 {
-    return 0; // compiler warns: no await, consider removing async
+    // Inside async void event handlers, wrap in try-catch
+    try { await LoadDataAsync(); }
+    catch (Exception ex) { ShowError(ex.Message); }
+};
+```
+
+**Rule 4: `ConfigureAwait(false)` in library code.**
+When a library method resumes after `await`, by default it tries to
+resume on the original `SynchronizationContext`. In ASP.NET Core, there
+is no SynchronizationContext, so this does not matter. But in libraries
+used from WinForms or WPF (which have a UI SynchronizationContext), the
+library code trying to resume on the UI thread can cause deadlocks.
+Library code should use `ConfigureAwait(false)`:
+
+```csharp
+// In library code
+public async Task<string> FetchAsync(string url, CancellationToken ct)
+{
+    var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
+    return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 }
-// Better:
-public Task<int> GetZeroAsync2() => Task.FromResult(0);
+// Not needed in ASP.NET Core applications — no SynchronizationContext
 ```
 
 ---
 
-## 8.4 CancellationToken
+## 8.4 `CancellationToken` — Cooperative Cancellation
+
+Cancellation in .NET is cooperative, not preemptive. You cannot force a
+running method to stop — you can only signal that cancellation has been
+requested and rely on the method to check for it and stop voluntarily.
+
+A `CancellationTokenSource` creates a `CancellationToken` and controls
+when it is cancelled. The token is passed to operations; they check it
+periodically and throw `OperationCanceledException` when it is cancelled.
 
 ```csharp
-// Create a token
-var cts = new CancellationTokenSource();
-var ct = cts.Token;
+// Creating a cancellation source
+using var cts = new CancellationTokenSource();
 
-// Cancel after timeout
-var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-// Or:
-cts.CancelAfter(TimeSpan.FromSeconds(30));
+// Cancel after a timeout
+using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
-// Cancel manually
-cts.Cancel(); // signals cancellation
-cts.Cancel(throwOnFirstException: false); // all registered callbacks run
+// Link two tokens: cancel if EITHER fires
+using var cts3 = CancellationTokenSource.CreateLinkedTokenSource(
+    userCancellation, timeoutCancellation);
 
-// Check for cancellation
-ct.ThrowIfCancellationRequested(); // throws OperationCanceledException
-bool isCancelled = ct.IsCancellationRequested;
-
-// Register cleanup callback
-ct.Register(() => Console.WriteLine("Cancelled!"));
-using var reg = ct.Register(() => CloseSocket()); // dispose to unregister
-
-// Linked token — cancel if any source cancels
-using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct1, ct2);
-
-// Pass through to all awaitable methods
-public async Task ProcessAllAsync(IEnumerable<string> items, CancellationToken ct)
+// In a method: check the token, pass it down
+public async Task ProcessItemsAsync(
+    IEnumerable<Item> items, CancellationToken ct)
 {
     foreach (var item in items)
     {
-        ct.ThrowIfCancellationRequested();  // check at loop boundaries
-        await ProcessItemAsync(item, ct);   // pass to awaitable
+        ct.ThrowIfCancellationRequested();   // check at each iteration
+        await ProcessOneAsync(item, ct);      // pass to every async call
     }
 }
 
-// Catching cancellation
+// Trigger cancellation
+cts.Cancel();                  // immediate
+await cts.CancelAsync();       // async (C# 10+)
+```
+
+```csharp
+// Consuming cancellation results
 try
 {
-    await LongOperationAsync(ct);
+    await ProcessItemsAsync(items, cts.Token);
 }
-catch (OperationCanceledException) when (ct.IsCancellationRequested)
+catch (OperationCanceledException)
 {
-    // graceful cancel — log, cleanup, but don't rethrow as error
-    _logger.LogInformation("Operation cancelled");
+    // Normal cancellation — clean up and move on
+    _logger.LogInformation("Processing cancelled");
 }
+```
+
+The `HttpClient` built into .NET checks the token on every read. The EF
+Core async methods accept and check it. Any API that performs I/O should
+accept and forward a `CancellationToken`.
+
+---
+
+## 8.5 Task Combinators — Running Multiple Operations
+
+Sometimes you need to run multiple async operations. How you combine them
+depends on whether you want them in parallel or sequentially.
+
+```csharp
+// Sequential: one after the other
+var user    = await GetUserAsync(id, ct);
+var orders  = await GetOrdersAsync(id, ct);
+var profile = await GetProfileAsync(id, ct);
+// Total time: sum of all three
+
+// Parallel with WhenAll: start all three, wait for all to complete
+// Much faster when the operations are independent
+var (user, orders, profile) = await (
+    GetUserAsync(id, ct),
+    GetOrdersAsync(id, ct),
+    GetProfileAsync(id, ct)
+).WhenAll();                  // runs all three concurrently
+// Total time: the slowest of the three
+
+// Or the explicit form
+var userTask    = GetUserAsync(id, ct);
+var ordersTask  = GetOrdersAsync(id, ct);
+var profileTask = GetProfileAsync(id, ct);
+await Task.WhenAll(userTask, ordersTask, profileTask);
+var user2    = await userTask;   // await again to get results (or check .Result after WhenAll)
+var orders2  = await ordersTask;
+```
+
+```csharp
+// WhenAny: complete as soon as the FIRST task finishes
+// Useful for: timeout races, fan-out where you only need one response
+var timeoutTask   = Task.Delay(TimeSpan.FromSeconds(5), ct);
+var operationTask = DoSlowOperationAsync(ct);
+var winner = await Task.WhenAny(operationTask, timeoutTask);
+if (winner == timeoutTask)
+    throw new TimeoutException("Operation took too long");
+var result = await operationTask;   // it completed — safe to await
 ```
 
 ---
 
-## 8.5 Task Combinators
+## 8.6 Channels — Producer/Consumer Pipelines
+
+`System.Threading.Channels` provides a high-performance, thread-safe
+queue for producer/consumer scenarios. It is the modern replacement for
+`BlockingCollection<T>` and `ConcurrentQueue<T>` for async code.
+
+A channel has a writer end and a reader end. One or more producers write
+to the writer; one or more consumers read from the reader. The channel
+buffers items between them.
 
 ```csharp
-// Task.WhenAll — wait for all, fail on first failure
-var tasks = urls.Select(url => httpClient.GetStringAsync(url)).ToList();
-string[] results = await Task.WhenAll(tasks);
-
-// Collect all errors (not just first)
-var results2 = await Task.WhenAll(tasks);
-// If any task faults, WhenAll's exception is AggregateException
-
-// Catch aggregate errors:
-try
+// Bounded channel: blocks the producer when the buffer is full (backpressure)
+// This prevents fast producers from overwhelming slow consumers
+var channel = Channel.CreateBounded<WorkItem>(new BoundedChannelOptions(100)
 {
-    await Task.WhenAll(tasks);
-}
-catch (Exception)
-{
-    var exceptions = tasks.Where(t => t.IsFaulted).Select(t => t.Exception!);
-    // handle each
-}
-
-// Task.WhenAny — return when any completes (race)
-var winner = await Task.WhenAny(tasks);
-string winnerResult = await winner; // re-await to unwrap exception
-
-// Task.WhenEach (NET 9+) — yield results as they complete
-await foreach (var task in Task.WhenEach(tasks))
-{
-    var result = await task; // available in order of completion
-    Console.WriteLine(result);
-}
-
-// Task.WaitAll / WaitAny — blocking versions (avoid in async code)
-Task.WaitAll(task1, task2); // blocks thread!
-
-// Parallel.ForEachAsync (NET 6+)
-await Parallel.ForEachAsync(items, new ParallelOptions
-{
-    MaxDegreeOfParallelism = 4,
-    CancellationToken = ct
-}, async (item, ct) =>
-{
-    await ProcessAsync(item, ct);
-});
-```
-
----
-
-## 8.6 Channels — Producer/Consumer
-
-`System.Threading.Channels` is the modern, high-performance alternative to `BlockingCollection<T>`.
-
-```csharp
-using System.Threading.Channels;
-
-// Unbounded channel
-var channel = Channel.CreateUnbounded<string>();
-
-// Bounded channel (backpressure)
-var bounded = Channel.CreateBounded<string>(new BoundedChannelOptions(100)
-{
-    FullMode = BoundedChannelFullMode.Wait, // producer waits when full
-    SingleReader = false,
-    SingleWriter = true
+    FullMode     = BoundedChannelFullMode.Wait,  // producer waits when full
+    SingleWriter = true,    // optimisation hint: only one writer
+    SingleReader = false,   // multiple readers (workers) are fine
 });
 
-// Producer
-async Task ProduceAsync(ChannelWriter<string> writer, CancellationToken ct)
+// Producer: writes items to the channel
+async Task Produce(ChannelWriter<WorkItem> writer, CancellationToken ct)
 {
     try
     {
-        for (int i = 0; i < 1000; i++)
-        {
-            await writer.WriteAsync($"item-{i}", ct);
-        }
+        await foreach (var item in GetItemsAsync(ct))
+            await writer.WriteAsync(item, ct);  // blocks if buffer full
     }
     finally
     {
-        writer.Complete(); // signal no more items
+        writer.Complete();  // signals "no more items" — readers see end of stream
     }
 }
 
-// Consumer
-async Task ConsumeAsync(ChannelReader<string> reader, CancellationToken ct)
+// Consumer: reads items from the channel
+async Task Consume(ChannelReader<WorkItem> reader, CancellationToken ct)
 {
     await foreach (var item in reader.ReadAllAsync(ct))
-    {
-        await ProcessAsync(item);
-    }
+        await ProcessAsync(item, ct);
+    // Loop ends automatically when writer calls Complete()
 }
 
-// Wire up
-var ch = Channel.CreateUnbounded<string>();
-var producer = ProduceAsync(ch.Writer, cts.Token);
-var consumer = ConsumeAsync(ch.Reader, cts.Token);
-await Task.WhenAll(producer, consumer);
-
-// Pipeline pattern
-Channel<T> CreatePipeline<T>(ChannelReader<T> input, Func<T, Task<T>> transform, int workers = 4)
-{
-    var output = Channel.CreateUnbounded<T>();
-    Task.Run(async () =>
-    {
-        await Parallel.ForEachAsync(input.ReadAllAsync(), new ParallelOptions
-        {
-            MaxDegreeOfParallelism = workers
-        }, async (item, ct) =>
-        {
-            var result = await transform(item);
-            await output.Writer.WriteAsync(result, ct);
-        });
-        output.Writer.Complete();
-    });
-    return output;
-}
+// Run producer and multiple consumers concurrently
+await Task.WhenAll(
+    Produce(channel.Writer, ct),
+    Consume(channel.Reader, ct),
+    Consume(channel.Reader, ct));   // two consumers share the same reader
 ```
+
+The bounded channel with `FullMode.Wait` creates natural *backpressure*:
+if consumers are slow, producers pause automatically. No items are lost
+and memory stays bounded even with arbitrarily large input.
 
 ---
 
-## 8.7 SemaphoreSlim — Async Rate Limiting
+## 8.7 `SemaphoreSlim` — Async Rate Limiting
+
+`SemaphoreSlim` is the async-safe way to limit how many operations run
+concurrently. It is an async mutual exclusion lock generalised to allow
+N simultaneous holders (not just 1):
 
 ```csharp
-// Limit concurrency to 5 parallel operations
-var semaphore = new SemaphoreSlim(5, 5);
+// Allow at most 8 concurrent HTTP requests
+// (Prevents overwhelming the downstream API with rate limits)
+private readonly SemaphoreSlim _throttle = new SemaphoreSlim(8, 8);
 
-async Task<string> FetchWithLimitAsync(string url)
+public async Task<string> FetchWithRateLimitAsync(string url, CancellationToken ct)
 {
-    await semaphore.WaitAsync();
+    await _throttle.WaitAsync(ct);   // blocks if 8 requests are already in-flight
     try
     {
-        return await httpClient.GetStringAsync(url);
+        return await _http.GetStringAsync(url, ct);
     }
     finally
     {
-        semaphore.Release();
+        _throttle.Release();   // always release, even if an exception occurs
     }
 }
 
-// Throttle many requests
-var tasks = urls.Select(url => FetchWithLimitAsync(url));
-var results = await Task.WhenAll(tasks); // max 5 concurrent
-
-// As a mutex (binary semaphore)
-var mutex = new SemaphoreSlim(1, 1);
-await mutex.WaitAsync();
-try
+// Throttled parallel processing: process all items but max 8 at once
+await Parallel.ForEachAsync(urls, new ParallelOptions
 {
-    // critical section
-}
-finally
-{
-    mutex.Release();
-}
+    MaxDegreeOfParallelism = 8,
+    CancellationToken = ct
+}, async (url, innerCt) => await FetchWithRateLimitAsync(url, innerCt));
 ```
 
 ---
 
-## 8.8 async/await Patterns
+## 8.8 Async Streams — `IAsyncEnumerable<T>`
 
-### Retry with Exponential Backoff
+A regular `IEnumerable<T>` produces items synchronously. When the source
+is async (a database, a file, a network stream), you need
+`IAsyncEnumerable<T>` — a sequence that produces items asynchronously,
+one at a time, with `await foreach`.
 
-```csharp
-public static async Task<T> RetryAsync<T>(
-    Func<CancellationToken, Task<T>> action,
-    int maxAttempts = 3,
-    TimeSpan? initialDelay = null,
-    CancellationToken ct = default)
-{
-    initialDelay ??= TimeSpan.FromSeconds(1);
-    Exception? lastEx = null;
-
-    for (int attempt = 0; attempt < maxAttempts; attempt++)
-    {
-        try
-        {
-            return await action(ct);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            lastEx = ex;
-            if (attempt < maxAttempts - 1)
-            {
-                var delay = initialDelay.Value * Math.Pow(2, attempt);
-                await Task.Delay(delay, ct);
-            }
-        }
-    }
-
-    throw new RetryExhaustedException($"Failed after {maxAttempts} attempts", lastEx!);
-}
-
-// Usage
-var data = await RetryAsync(
-    ct => httpClient.GetStringAsync("https://example.com", ct),
-    maxAttempts: 3,
-    initialDelay: TimeSpan.FromSeconds(2),
-    ct: cancellationToken);
-```
-
-### Timeout Wrapper
+This is the async equivalent of `yield return` (Chapter 3 §3.6):
 
 ```csharp
-public static async Task<T> WithTimeoutAsync<T>(
-    Func<CancellationToken, Task<T>> action,
-    TimeSpan timeout,
-    CancellationToken ct = default)
-{
-    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    cts.CancelAfter(timeout);
-    try
-    {
-        return await action(cts.Token);
-    }
-    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-    {
-        throw new TimeoutException($"Operation timed out after {timeout}");
-    }
-}
-```
-
-### Fire-and-Forget with Error Handling
-
-```csharp
-// Never use: _ = Task.Run(async () => await Something()); — errors are swallowed
-
-// Better: proper fire-and-forget with logging
-public static void FireAndForget(
-    this Task task,
-    ILogger? logger = null,
-    [CallerMemberName] string caller = "")
-{
-    task.ContinueWith(t =>
-    {
-        if (t.IsFaulted)
-            logger?.LogError(t.Exception, "Unhandled exception in fire-and-forget from {Caller}", caller);
-    }, TaskContinuationOptions.OnlyOnFaulted);
-}
-
-// Usage
-DoSomethingAsync().FireAndForget(_logger);
-```
-
----
-
-## 8.9 Parallel Programming
-
-```csharp
-// Parallel.For / Parallel.ForEach — CPU-bound work on multiple threads
-var results = new ConcurrentBag<int>();
-
-Parallel.For(0, 1000, i =>
-{
-    results.Add(ExpensiveComputation(i));
-});
-
-Parallel.ForEach(items, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, item =>
-{
-    ProcessItem(item);
-});
-
-// PLINQ — parallel LINQ
-var primes = Enumerable.Range(2, 1_000_000)
-    .AsParallel()                           // parallelize
-    .WithDegreeOfParallelism(4)
-    .WithCancellation(ct)
-    .Where(IsPrime)
-    .OrderBy(n => n)                        // re-sequential for ordering
-    .ToList();
-
-// AsOrdered — preserve input order (with perf cost)
-var orderedResults = items.AsParallel().AsOrdered().Select(Transform).ToList();
-
-// ForAll — side-effecting parallel action
-items.AsParallel().ForAll(item => ProcessItem(item));
-```
-
----
-
-## 8.10 Async Streams (IAsyncEnumerable\<T\>)
-
-```csharp
-// Producer — async generator
-public static async IAsyncEnumerable<WeatherReading> GetReadingsAsync(
-    string station,
+// Producer: yield return inside an async method
+public async IAsyncEnumerable<Order> StreamOrdersAsync(
     [EnumeratorCancellation] CancellationToken ct = default)
 {
-    while (!ct.IsCancellationRequested)
-    {
-        var reading = await FetchCurrentReadingAsync(station, ct);
-        yield return reading;
-        await Task.Delay(TimeSpan.FromMinutes(5), ct);
-    }
+    await using var conn = await _db.OpenConnectionAsync(ct);
+
+    await foreach (var order in _db.Orders.AsAsyncEnumerable().WithCancellation(ct))
+        yield return order;
 }
 
-// Consumer
-await foreach (var reading in GetReadingsAsync("station-A", cts.Token))
+// Consumer: await foreach
+await foreach (var order in StreamOrdersAsync(ct))
 {
-    Console.WriteLine($"{reading.Timestamp}: {reading.Temperature}°C");
-    if (reading.Temperature > 40) cts.Cancel();
+    await ProcessAsync(order, ct);
+    // Each order is processed immediately — no need to load all orders first
 }
-
-// Operators via LINQ (System.Linq.Async NuGet package)
-using System.Linq;
-
-var high = GetReadingsAsync("A")
-    .Where(r => r.Temperature > 30)
-    .Take(10);
-
-await foreach (var r in high)
-    Console.WriteLine(r);
 ```
+
+The advantage over `ToListAsync()`: with a stream, you process each item
+as soon as it arrives. You never hold the full result set in memory. For
+a table with a million rows, this is the difference between 1MB and 1GB
+of memory.
 
 ---
 
-## 8.11 Thread Safety Primitives
+## 8.9 Thread Safety Primitives
+
+Async code runs on thread pool threads. Multiple async operations can
+run concurrently, and if they share state, you have race conditions. See
+Chapter 38 for the full treatment; here are the essential primitives:
 
 ```csharp
-// Interlocked — lock-free atomic operations
-private int _count = 0;
-int newCount = Interlocked.Increment(ref _count);
-int dec      = Interlocked.Decrement(ref _count);
-int old      = Interlocked.Exchange(ref _count, 0);
-int compared = Interlocked.CompareExchange(ref _count, 100, 0); // set to 100 if was 0
-Interlocked.Add(ref _count, 5);
-
-// volatile — prevents CPU and compiler reordering
-private volatile bool _running = true;
-// Ensure reads/writes aren't cached in registers
-
-// Monitor / lock
+// lock: protect a critical section — only one thread at a time
 private readonly object _lock = new();
+private int _counter = 0;
 
-public void AddItem(string item)
+void Increment()
 {
     lock (_lock)
     {
-        _items.Add(item);
+        _counter++;   // read-modify-write is now atomic
     }
 }
 
-// ReaderWriterLockSlim — many readers, exclusive writer
-private readonly ReaderWriterLockSlim _rwLock = new();
-
-public string Read(string key)
+// NEVER await inside a lock:
+lock (_lock)
 {
-    _rwLock.EnterReadLock();
-    try { return _dict[key]; }
-    finally { _rwLock.ExitReadLock(); }
+    await DoSomethingAsync();   // COMPILE ERROR — by design
+    // lock is held by a thread; await may resume on a different thread
+    // SemaphoreSlim(1,1) is the async-safe alternative to lock
 }
 
-public void Write(string key, string val)
-{
-    _rwLock.EnterWriteLock();
-    try { _dict[key] = val; }
-    finally { _rwLock.ExitWriteLock(); }
-}
+// Interlocked: atomic operations without lock overhead
+Interlocked.Increment(ref _counter);
+Interlocked.Add(ref _total, amount);
+int snapshot = Interlocked.CompareExchange(ref _state, newValue, expectedOld);
 ```
 
-> **Rider tip:** Rider's *Async* call stack is visible in the debugger under *Debug → Async Stacks* — it shows the logical async call chain across thread switches, not just the current physical stack.
+---
 
-> **VS tip:** *Debug → Windows → Tasks* shows all active Task objects. *Debug → Windows → Parallel Stacks* visualizes all thread stacks and task continuations simultaneously. Very useful for diagnosing deadlocks.
+## 8.10 Parallel Programming — CPU-Bound Work
 
+`async`/`await` is for I/O-bound work (waiting for external operations).
+CPU-bound work (heavy computation that keeps the CPU busy) is parallelised
+differently — with `Task.Run`, `Parallel`, or `PLINQ`:
 
-> **See also:** [Chapter 20 §20.6 — Explicit Over Implicit](ch20_principles.md) — always pass `CancellationToken` and `ISystemClock` as parameters rather than using `DateTime.UtcNow` directly. [Chapter 19 §19.10](ch19_di_deep_dive.md) — the `BackgroundService` + `IServiceScopeFactory` pattern for long-running workers.
+```csharp
+// Task.Run: offload CPU work to a thread pool thread
+// The calling thread is freed to do other work
+double result = await Task.Run(() => ComputeHeavyMath(largeDataSet), ct);
+
+// Parallel.ForEachAsync: process items concurrently with async support
+await Parallel.ForEachAsync(items,
+    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = ct },
+    async (item, innerCt) =>
+    {
+        await ProcessItemAsync(item, innerCt);
+    });
+
+// PLINQ: parallel LINQ for CPU-bound data transformation
+var results = items.AsParallel()
+                   .WithDegreeOfParallelism(4)
+                   .Where(x => ExpensiveFilter(x))
+                   .Select(x => ExpensiveTransform(x))
+                   .ToList();
+```
+
+Do not use `Task.Run` for I/O-bound work — it wastes a thread pool
+thread on waiting. Use the native async methods: `await httpClient.GetAsync()`,
+not `await Task.Run(() => httpClient.GetAsync().Result)`.
+
+---
+
+## 8.11 Connecting Async to the Rest of the Book
+
+- **Ch 7 (Collections, LINQ)** — `IAsyncEnumerable<T>` extends LINQ
+  into the async world. `ToListAsync()`, `FirstOrDefaultAsync()` are
+  async versions of LINQ terminal operators.
+- **Ch 12 (IO)** — All file, network, and stream operations have async
+  variants. Async I/O is what prevents I/O-bound threads from blocking.
+- **Ch 13 (Networking)** — `HttpClient`, gRPC, and WebSocket APIs are
+  entirely async. Every call returns a `Task` or `ValueTask`.
+- **Ch 14 (ASP.NET Core)** — Every request handler is async. The
+  middleware pipeline is async. The framework handles the
+  SynchronizationContext details for you.
+- **Ch 15 (EF Core)** — All database operations have async variants:
+  `ToListAsync`, `SaveChangesAsync`, `FindAsync`. Use them always.
+- **Ch 38 (Multithreading)** — Channels, locks, and race conditions
+  in full. This chapter covers the problems; Chapter 38 shows them in
+  real projects.

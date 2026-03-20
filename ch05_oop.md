@@ -1,588 +1,524 @@
 # Chapter 5 — OOP: Classes, Interfaces, Inheritance & Polymorphism
 
-## 5.1 Classes — Full Anatomy
+> Object-Oriented Programming is the dominant paradigm in C# and the
+> foundation of every framework it runs on top of. But OOP is widely
+> misunderstood — textbooks teach "classes and inheritance" while
+> real-world C# emphasises "composition and interfaces". This chapter
+> explains OOP as it is actually practised, not as it is theorised.
+
+*Building on:* Ch 2 (types, records), Ch 3 (pattern matching),
+Ch 4 (delegates, extension methods)
+
+---
+
+## 5.1 Classes — The Blueprint of an Object
+
+A class is a blueprint that defines state (fields, properties) and
+behaviour (methods). An instance is a particular object created from
+that blueprint. The class defines what every instance knows and can do;
+each instance holds its own copy of the state.
+
+The key responsibility of a well-designed class is *encapsulation*: hiding
+internal details and exposing only what consumers need. This protects
+the class from being used incorrectly and allows the internals to change
+without breaking callers.
 
 ```csharp
-// Complete class with all common members
 public class BankAccount
 {
-    // ── Static members ────────────────────────────────────────────────
-    private static int _nextId = 0;
-    public static int TotalAccounts => _nextId;
-
-    // Static constructor — runs once before first use
-    static BankAccount() { /* initialize static state */ }
-
-    // ── Instance fields ───────────────────────────────────────────────
-    private readonly int _id;
+    // Private field: internal state, hidden from outside
     private decimal _balance;
-    private readonly string _owner;
-    private readonly List<Transaction> _history = new();
 
-    // ── Constructors ──────────────────────────────────────────────────
-    public BankAccount(string owner, decimal initialBalance = 0m)
+    // Property: controlled public access to private state
+    // Getter: anyone can read the balance
+    // Setter: private — only this class can set it
+    public decimal Balance { get; private set; }
+
+    // Read-only identity — set once at construction
+    public string  AccountId   { get; }
+    public string  OwnerName   { get; }
+    public DateTime OpenedAt   { get; }
+
+    // Constructor: establishes valid initial state
+    // The class enforces its own invariants here
+    public BankAccount(string accountId, string ownerName, decimal initialDeposit)
     {
-        ArgumentException.ThrowIfNullOrEmpty(owner);
-        if (initialBalance < 0) throw new ArgumentOutOfRangeException(nameof(initialBalance));
+        if (string.IsNullOrWhiteSpace(accountId))
+            throw new ArgumentException("Account ID required", nameof(accountId));
+        if (initialDeposit < 0)
+            throw new ArgumentOutOfRangeException(nameof(initialDeposit), "Cannot open with negative balance");
 
-        _id = Interlocked.Increment(ref _nextId);
-        _owner = owner;
-        _balance = initialBalance;
+        AccountId = accountId;
+        OwnerName = ownerName;
+        Balance   = initialDeposit;
+        OpenedAt  = DateTime.UtcNow;
     }
 
-    // Constructor chaining (this(...))
-    public BankAccount(string owner) : this(owner, 0m) { }
-
-    // ── Properties ────────────────────────────────────────────────────
-    public int Id => _id;                              // read-only computed
-    public string Owner => _owner;
-    public decimal Balance => _balance;
-    public IReadOnlyList<Transaction> History => _history.AsReadOnly();
-
-    // Auto-property with init (C# 9+)
-    public DateTime CreatedAt { get; } = DateTime.UtcNow;
-
-    // Property with validation in setter
-    private string? _label;
-    public string? Label
-    {
-        get => _label;
-        set => _label = value?.Trim();
-    }
-
-    // ── Methods ───────────────────────────────────────────────────────
+    // Behaviour: the only way to change the balance
+    // Callers cannot set Balance directly — they must go through this method
     public void Deposit(decimal amount)
     {
-        if (amount <= 0) throw new ArgumentOutOfRangeException(nameof(amount));
-        _balance += amount;
-        _history.Add(new Transaction(TransactionType.Deposit, amount));
+        if (amount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(amount), "Deposit must be positive");
+        Balance += amount;
     }
 
-    public bool TryWithdraw(decimal amount, out string? error)
+    public void Withdraw(decimal amount)
     {
-        if (amount <= 0) { error = "Amount must be positive"; return false; }
-        if (_balance < amount) { error = "Insufficient funds"; return false; }
-        _balance -= amount;
-        _history.Add(new Transaction(TransactionType.Withdrawal, amount));
-        error = null;
-        return true;
+        if (amount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(amount), "Withdrawal must be positive");
+        if (amount > Balance)
+            throw new InvalidOperationException($"Insufficient funds. Balance: {Balance:C}");
+        Balance -= amount;
+    }
+}
+```
+
+This encapsulation is the difference between a class that *protects its
+own invariants* and a data bag that could be put into any invalid state
+by any caller.
+
+### Access Modifiers — Who Can See What
+
+| Modifier | Visibility |
+|---|---|
+| `public` | Everyone — part of the public API surface |
+| `internal` | Only within the same assembly (project) |
+| `protected` | Only this class and its subclasses |
+| `protected internal` | Protected OR internal |
+| `private protected` | Protected AND internal |
+| `private` | Only this class (the default for class members) |
+| `file` | Only within the same file (C# 11+) |
+
+The practical rule: **start private, expose only what is necessary.**
+Every public member is a commitment to maintain forever.
+
+---
+
+## 5.2 Inheritance — Sharing Behaviour Across Types
+
+Inheritance allows a class to extend another class, inheriting all its
+public and protected members and adding or overriding them. It expresses
+an "is-a" relationship: a `SavingsAccount` *is a* `BankAccount`.
+
+```csharp
+public class SavingsAccount : BankAccount
+{
+    public decimal InterestRate { get; }
+
+    public SavingsAccount(string id, string owner, decimal initial, decimal interestRate)
+        : base(id, owner, initial)   // call the base class constructor
+    {
+        InterestRate = interestRate;
     }
 
-    // ── Overrides ─────────────────────────────────────────────────────
-    public override string ToString() => $"Account#{_id} [{_owner}]: {_balance:C}";
-    public override bool Equals(object? obj) => obj is BankAccount other && _id == other._id;
-    public override int GetHashCode() => _id.GetHashCode();
+    // Add new behaviour
+    public void ApplyInterest()
+    {
+        Deposit(Balance * InterestRate);  // reuses inherited Deposit method
+    }
+}
+```
 
-    // ── Operators ─────────────────────────────────────────────────────
-    public static bool operator ==(BankAccount? a, BankAccount? b)
-        => a?.Equals(b) ?? b is null;
-    public static bool operator !=(BankAccount? a, BankAccount? b) => !(a == b);
+### `virtual`, `override`, and `sealed`
+
+Methods are not overridable by default. You must explicitly mark a base
+class method `virtual` to allow subclasses to replace it:
+
+```csharp
+public class Shape
+{
+    // virtual: subclasses MAY override this
+    public virtual double Area() => 0;
+
+    // non-virtual: cannot be overridden — always this implementation
+    public string Describe() => $"A shape with area {Area():F2}";
 }
 
-// Supporting types
-public enum TransactionType { Deposit, Withdrawal, Transfer }
-public record Transaction(TransactionType Type, decimal Amount, DateTime At = default)
+public class Circle(double radius) : Shape
 {
-    public DateTime At { get; } = At == default ? DateTime.UtcNow : At;
+    // override: replaces the base class implementation
+    public override double Area() => Math.PI * radius * radius;
+}
+
+public sealed class Sphere : Circle    // sealed: cannot be subclassed further
+{
+    private double _radius;
+    public Sphere(double r) : base(r) { _radius = r; }
+
+    // sealed override: this is the final implementation
+    public sealed override double Area() => 4 * Math.PI * _radius * _radius;
+}
+```
+
+### `abstract` Classes — Force Subclasses to Implement
+
+An abstract class cannot be instantiated. It exists to provide a partial
+implementation and declare that subclasses must complete it:
+
+```csharp
+public abstract class Exporter
+{
+    // abstract: no implementation here — MUST be overridden
+    protected abstract string FormatData(IEnumerable<Row> rows);
+
+    // Template method: algorithm structure fixed here, steps delegated to subclasses
+    public void Export(IEnumerable<Row> rows, Stream output)
+    {
+        var formatted = FormatData(rows);  // calls the subclass's implementation
+        using var writer = new StreamWriter(output);
+        writer.Write(formatted);
+    }
+}
+
+public class CsvExporter : Exporter
+{
+    protected override string FormatData(IEnumerable<Row> rows) =>
+        string.Join("\n", rows.Select(r => string.Join(",", r.Values)));
 }
 ```
 
 ---
 
-## 5.2 Inheritance
+## 5.3 Interfaces — The Most Important OOP Tool in Real C#
+
+An interface is a *contract*: it declares what methods, properties, and
+events a type must provide, without any implementation. Any class that
+wants to fulfil the contract declares it implements the interface.
+
+While inheritance is hierarchical (one parent), a class can implement
+*any number* of interfaces. This is what makes interfaces the preferred
+abstraction in real-world C# design.
+
+### Why Interfaces Over Abstract Classes?
+
+The critical benefit of interfaces is **decoupling**. When code depends
+on an interface rather than a concrete class, you can:
+
+1. Replace the implementation without changing callers
+2. Provide test doubles in unit tests
+3. Register different implementations based on environment or config
+4. Compose multiple behaviours without deep inheritance trees
 
 ```csharp
-public abstract class Animal
+// Interface: the contract that all implementations must fulfil
+public interface IEmailSender
 {
-    public string Name { get; }
-    public int Age { get; }
+    Task SendAsync(string to, string subject, string body, CancellationToken ct = default);
+}
 
-    protected Animal(string name, int age)
+// Production implementation
+public class SmtpEmailSender(SmtpOptions options) : IEmailSender
+{
+    public async Task SendAsync(string to, string subject, string body, CancellationToken ct)
     {
-        Name = name;
-        Age = age;
+        // ... real SMTP logic ...
     }
-
-    // Abstract — must be overridden
-    public abstract string Sound();
-
-    // Virtual — can be overridden
-    public virtual string Describe()
-        => $"{GetType().Name} named {Name}, age {Age}, says '{Sound()}'";
-
-    // Non-virtual — cannot be overridden
-    public string GetId() => $"{GetType().Name}_{Name}";
 }
 
-public class Dog : Animal
+// Test implementation — swapped in during unit tests
+public class FakeEmailSender : IEmailSender
 {
-    public string Breed { get; }
+    public List<(string To, string Subject)> SentEmails { get; } = new();
 
-    public Dog(string name, int age, string breed) : base(name, age)
+    public Task SendAsync(string to, string subject, string body, CancellationToken ct)
     {
-        Breed = breed;
+        SentEmails.Add((to, subject));
+        return Task.CompletedTask;
     }
-
-    public override string Sound() => "Woof";
-
-    // Override and extend
-    public override string Describe()
-        => base.Describe() + $" (breed: {Breed})";
 }
 
-public class Cat : Animal
+// The service depends on the interface, not any concrete class
+public class OrderService(IEmailSender email)
 {
-    public bool IsIndoor { get; }
-
-    public Cat(string name, int age, bool isIndoor) : base(name, age)
+    public async Task CompleteOrderAsync(Order order, CancellationToken ct)
     {
-        IsIndoor = isIndoor;
+        // ... complete the order ...
+        await email.SendAsync(order.CustomerEmail, "Order confirmed", "...", ct);
+        // works whether email is SmtpEmailSender or FakeEmailSender
     }
-
-    public override string Sound() => "Meow";
-}
-
-// Polymorphism
-List<Animal> animals = [
-    new Dog("Rex", 3, "German Shepherd"),
-    new Cat("Whiskers", 2, true),
-    new Dog("Buddy", 5, "Labrador"),
-];
-
-foreach (var a in animals)
-    Console.WriteLine(a.Describe()); // virtual dispatch
-```
-
-### `sealed` — Prevent Overriding
-
-```csharp
-public class PremiumAccount : BankAccount
-{
-    // sealed override — cannot be overridden by further subclasses
-    public sealed override string ToString() => $"[PREMIUM] {base.ToString()}";
-}
-
-// sealed class — cannot be inherited
-public sealed class SingletonService
-{
-    public static SingletonService Instance { get; } = new();
-    private SingletonService() { }
 }
 ```
 
-### `new` — Hiding (vs. `override`)
-
-```csharp
-public class Base
-{
-    public virtual string Greet() => "Hello from Base";
-    public string Name => "Base";  // non-virtual
-}
-
-public class Derived : Base
-{
-    public override string Greet() => "Hello from Derived"; // polymorphic
-    public new string Name => "Derived"; // hiding — NOT polymorphic
-}
-
-Base b = new Derived();
-Console.WriteLine(b.Greet()); // "Hello from Derived" — virtual dispatch
-Console.WriteLine(b.Name);    // "Base" — not virtual, uses static type
-```
-
----
-
-## 5.3 Interfaces
-
-### Defining and Implementing
-
-```csharp
-// Interface definition
-public interface IRepository<T> where T : class, IEntity
-{
-    Task<T?> GetByIdAsync(int id, CancellationToken ct = default);
-    Task<IReadOnlyList<T>> GetAllAsync(CancellationToken ct = default);
-    Task<int> AddAsync(T entity, CancellationToken ct = default);
-    Task UpdateAsync(T entity, CancellationToken ct = default);
-    Task DeleteAsync(int id, CancellationToken ct = default);
-}
-
-// Implementing
-public class SqlUserRepository : IRepository<User>
-{
-    private readonly AppDbContext _db;
-    public SqlUserRepository(AppDbContext db) => _db = db;
-
-    public async Task<User?> GetByIdAsync(int id, CancellationToken ct = default)
-        => await _db.Users.FindAsync([id], ct);
-
-    public async Task<IReadOnlyList<User>> GetAllAsync(CancellationToken ct = default)
-        => await _db.Users.ToListAsync(ct);
-
-    public async Task<int> AddAsync(User user, CancellationToken ct = default)
-    {
-        _db.Users.Add(user);
-        await _db.SaveChangesAsync(ct);
-        return user.Id;
-    }
-
-    public async Task UpdateAsync(User user, CancellationToken ct = default)
-    {
-        _db.Users.Update(user);
-        await _db.SaveChangesAsync(ct);
-    }
-
-    public async Task DeleteAsync(int id, CancellationToken ct = default)
-    {
-        var user = await GetByIdAsync(id, ct);
-        if (user is not null)
-        {
-            _db.Users.Remove(user);
-            await _db.SaveChangesAsync(ct);
-        }
-    }
-}
-```
+This is the foundation of Dependency Injection (Chapter 10–11). The DI
+container gives `OrderService` whichever `IEmailSender` is registered for
+the current environment.
 
 ### Default Interface Members (C# 8+)
 
-```csharp
-public interface ILogger
-{
-    void Log(string message, LogLevel level);
-
-    // Default implementation — implementing class doesn't have to override
-    void LogInfo(string message)    => Log(message, LogLevel.Information);
-    void LogWarning(string message) => Log(message, LogLevel.Warning);
-    void LogError(string message)   => Log(message, LogLevel.Error);
-
-    // Default static factory
-    static ILogger Null => NullLogger.Instance;
-}
-
-// Minimal implementation
-public class ConsoleLogger : ILogger
-{
-    public void Log(string message, LogLevel level)
-        => Console.WriteLine($"[{level}] {message}");
-    // LogInfo/LogWarning/LogError come for free from defaults
-}
-```
-
-### Static Interface Members (C# 11+)
+Interfaces can now provide default implementations, allowing you to add
+methods to an existing interface without breaking all existing
+implementations:
 
 ```csharp
-// Interfaces can have static abstract/virtual members
-public interface IAddable<T> where T : IAddable<T>
+public interface IRepository<T>
 {
-    static abstract T Zero { get; }
-    static abstract T operator +(T left, T right);
-}
+    Task<T?> GetByIdAsync(int id, CancellationToken ct);
+    Task<IReadOnlyList<T>> GetAllAsync(CancellationToken ct);
 
-public interface IParseable<T> where T : IParseable<T>
-{
-    static abstract T Parse(string s);
-    static virtual T? TryParse(string s) => // virtual with default
-        TryParseImpl(s, out var v) ? v : default;
-    private static bool TryParseImpl(string s, out T? v) => throw new NotImplementedException();
-}
-
-// Generic math (System.Numerics):
-// INumber<T>, IComparable<T>, IFloatingPoint<T>, IInteger<T>, etc.
-public static T Sum<T>(IEnumerable<T> items) where T : INumber<T>
-{
-    T total = T.Zero;
-    foreach (var item in items) total += item;
-    return total;
-}
-
-// Works with int, double, decimal, float, etc.
-Sum([1, 2, 3, 4, 5]);           // 15
-Sum([1.5, 2.5, 3.0]);           // 7.0
-Sum([1.99m, 2.01m, 3.00m]);     // 7.00m
-```
-
-### Explicit Interface Implementation
-
-```csharp
-public interface IJsonSerializable
-{
-    string ToJson();
-}
-
-public interface IXmlSerializable
-{
-    string ToXml();
-}
-
-public class User : IJsonSerializable, IXmlSerializable
-{
-    public string Name { get; }
-    public int Age { get; }
-
-    public User(string name, int age) { Name = name; Age = age; }
-
-    // Explicit implementation — only accessible via interface reference
-    string IJsonSerializable.ToJson()
-        => $"{{\"name\":\"{Name}\",\"age\":{Age}}}";
-
-    string IXmlSerializable.ToXml()
-        => $"<User><Name>{Name}</Name><Age>{Age}</Age></User>";
-}
-
-var user = new User("Alice", 30);
-// user.ToJson(); // Compile error — not accessible on User
-((IJsonSerializable)user).ToJson(); // OK
-IXmlSerializable xml = user;
-xml.ToXml(); // OK
-```
-
----
-
-## 5.4 Abstract Classes vs. Interfaces
-
-| Feature | Abstract Class | Interface |
-|---------|---------------|-----------|
-| Instantiation | No | No |
-| State (fields) | Yes | No (only static, C# 11+) |
-| Constructor | Yes | No |
-| Default methods | Yes | Yes (C# 8+) |
-| Multiple inheritance | No (single base only) | Yes (multiple interfaces) |
-| Access modifiers on members | Yes | All public (default) |
-| Use when | Shared implementation + IS-A relationship | Capability / contract / multiple behavior |
-
-```csharp
-// Abstract class — for shared implementation
-public abstract class Transport
-{
-    private readonly string _name;
-    protected Transport(string name) => _name = name;
-
-    // Shared implementation
-    public void Start() { Initialize(); Console.WriteLine($"{_name} started."); }
-    public void Stop()  { Shutdown(); Console.WriteLine($"{_name} stopped."); }
-
-    // Subclass-specific
-    protected abstract void Initialize();
-    protected abstract void Shutdown();
-    public abstract int MaxPassengers { get; }
-}
-
-// Interface — for capability
-public interface IElectric
-{
-    double BatteryLevel { get; }
-    void Charge();
-}
-
-public interface ISelfDriving
-{
-    void EnableAutopilot();
-    void DisableAutopilot();
-}
-
-// Class can extend one abstract class, implement many interfaces
-public class ElectricCar : Transport, IElectric, ISelfDriving
-{
-    private double _battery = 100;
-    private bool _autopilot = false;
-
-    public ElectricCar() : base("ElectricCar") { }
-
-    public override int MaxPassengers => 5;
-    protected override void Initialize() => Console.WriteLine("Checking battery...");
-    protected override void Shutdown()   => Console.WriteLine("Saving state...");
-
-    public double BatteryLevel => _battery;
-    public void Charge()           => _battery = 100;
-    public void EnableAutopilot()  => _autopilot = true;
-    public void DisableAutopilot() => _autopilot = false;
-}
-```
-
----
-
-## 5.5 Properties — Advanced
-
-```csharp
-public class Circle
-{
-    // Required init-only (C# 11+)
-    public required double Radius { get; init; }
-
-    // Computed property
-    public double Diameter    => Radius * 2;
-    public double Area        => Math.PI * Radius * Radius;
-    public double Circumference => 2 * Math.PI * Radius;
-
-    // Property with backing field and validation
-    private int _sides = 1;
-    public int Sides
+    // Default implementation: any class that implements GetAllAsync
+    // automatically gets Count — they can override it for efficiency
+    async Task<int> CountAsync(CancellationToken ct)
     {
-        get => _sides;
-        private set => _sides = value > 0
-            ? value
-            : throw new ArgumentOutOfRangeException(nameof(value), "Must be positive");
+        var all = await GetAllAsync(ct);
+        return all.Count;
     }
 }
-
-// Init-only property
-public record class Point
-{
-    public required double X { get; init; }
-    public required double Y { get; init; }
-}
-var p = new Point { X = 1, Y = 2 };
-// p.X = 5; // Compile error — init only
-
-// Property pattern with expression body
-public class Temperature
-{
-    public double Celsius { get; }
-    public double Fahrenheit => Celsius * 9.0 / 5.0 + 32;
-    public Temperature(double celsius) => Celsius = celsius;
-}
-
-// Indexer
-public class Matrix<T>
-{
-    private readonly T[,] _data;
-
-    public Matrix(int rows, int cols) => _data = new T[rows, cols];
-
-    public T this[int row, int col]
-    {
-        get => _data[row, col];
-        set => _data[row, col] = value;
-    }
-
-    public int Rows => _data.GetLength(0);
-    public int Cols => _data.GetLength(1);
-}
-
-var m = new Matrix<double>(3, 3);
-m[0, 0] = 1.0;
-m[1, 1] = 2.0;
-Console.WriteLine(m[0, 0]); // 1.0
 ```
 
 ---
 
-## 5.6 Object Initialization Patterns
+## 5.4 Abstract Classes vs. Interfaces — When to Use Each
+
+This is one of the most common design questions. Here is the practical
+guide:
+
+| Situation | Use |
+|---|---|
+| Multiple unrelated types should share a contract | Interface |
+| You want to replace an implementation in tests or config | Interface |
+| You have shared implementation to provide to subclasses | Abstract class |
+| You are implementing a template method (fixed algorithm, variable steps) | Abstract class |
+| You need to add behaviour to an existing type without modifying it | Interface + extension method |
+| You need to represent "can do X" orthogonally to class hierarchy | Interface |
+
+The idiomatic .NET pattern:
+- Define an *interface* for the abstraction
+- Provide a *base class* as an optional convenience for implementations
+  that share a lot of code
 
 ```csharp
-// Object initializer
-var user = new User
+// Interface: the contract
+public interface ICache<TKey, TValue>
 {
-    Name = "Alice",
-    Age = 30,
-    Email = "alice@example.com"
+    bool TryGet(TKey key, out TValue? value);
+    void Set(TKey key, TValue value, TimeSpan? ttl = null);
+    void Invalidate(TKey key);
+}
+
+// Base class: partial implementation for implementations that use a Dictionary
+public abstract class DictionaryCache<TKey, TValue> : ICache<TKey, TValue>
+    where TKey : notnull
+{
+    protected readonly Dictionary<TKey, TValue> _store = new();
+
+    public bool TryGet(TKey key, out TValue? value) =>
+        _store.TryGetValue(key, out value);
+
+    public void Invalidate(TKey key) => _store.Remove(key);
+
+    // Set is still abstract — subclasses decide TTL strategy
+    public abstract void Set(TKey key, TValue value, TimeSpan? ttl = null);
+}
+```
+
+---
+
+## 5.5 Properties — Smart Fields
+
+Properties look like fields at the call site but execute code when read
+or written. They let you add validation, lazy initialisation, change
+notification, or computed values while keeping a clean public API.
+
+```csharp
+public class Product
+{
+    private decimal _price;
+    private string  _name = "";
+
+    // Validation in the setter
+    public decimal Price
+    {
+        get => _price;
+        set
+        {
+            if (value < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Price cannot be negative");
+            _price = value;
+        }
+    }
+
+    // Auto-property: compiler generates the backing field
+    public string Category { get; set; } = "General";
+
+    // Computed property: no backing field, calculated on access
+    public string DisplayName => $"{_name} ({Category})";
+
+    // Init-only: settable only in constructor or object initialiser (Ch 2 §2.6)
+    public string Sku { get; init; } = "";
+}
+```
+
+### Expression-Bodied Members
+
+Single-expression methods, properties, and accessors can use `=>` syntax.
+It is concise but should not be forced — use it where the body genuinely
+fits on one line and reads clearly:
+
+```csharp
+// Fine: truly simple
+public string FullName => $"{FirstName} {LastName}";
+public bool IsAdult => Age >= 18;
+
+// Do not force it for complex logic
+public bool IsEligible =>  // better as a full method
+    Age >= 18 && !IsBlocked && Tier != "restricted" && AccountBalance >= 0;
+```
+
+---
+
+## 5.6 Object Initialisation Patterns
+
+C# provides several ways to initialise objects. Each makes different
+trade-offs between brevity, immutability, and validation.
+
+```csharp
+// Constructor: validation and complex setup
+var account = new BankAccount("ACC001", "Alice", 1000m);
+
+// Object initialiser: sets public properties after construction
+// Properties must have public setters (or init)
+var config = new ServerConfig
+{
+    Host = "localhost",
+    Port = 5432,
+    Database = "mydb"
 };
 
-// Collection initializer
-var names = new List<string> { "Alice", "Bob", "Charlie" };
-var dict  = new Dictionary<string, int> { ["a"] = 1, ["b"] = 2 };
+// With init-only properties: safe for immutable types
+public record ProductConfig
+{
+    public required string Name     { get; init; }
+    public required decimal Price   { get; init; }
+    public string Category          { get; init; } = "General";
+}
 
-// Collection expressions (C# 12+)
-string[] arr = ["Alice", "Bob", "Charlie"];
-List<int> nums = [1, 2, 3, 4, 5];
-int[] combined = [..arr1, ..arr2];  // spread operator
+var product = new ProductConfig
+{
+    Name  = "Widget",
+    Price = 9.99m
+    // Category defaults to "General"
+};
 
-// Object initializer with records (with-expression)
-var p1 = new Point { X = 1, Y = 2 };
-var p2 = p1 with { X = 99 };
-
-// Builder pattern (fluent)
-var config = new ConfigBuilder()
-    .WithHost("localhost")
-    .WithPort(5432)
-    .WithDatabase("mydb")
-    .WithCredentials("user", "pass")
-    .Build();
+// required keyword (C# 11): compiler error if not set at creation
+// Guarantees the property is always initialised — no forgetting
 ```
 
 ---
 
-## 5.7 Object Comparison and Equality
+## 5.7 Object Equality and `IComparable`
+
+By default, class equality means *reference equality* — two objects are
+equal only if they are the same object. Override this for types whose
+identity is determined by content:
 
 ```csharp
-public class Product : IEquatable<Product>, IComparable<Product>
+public class EmailAddress : IEquatable<EmailAddress>
 {
-    public string Sku { get; }
-    public decimal Price { get; }
+    public string Value { get; }
 
-    public Product(string sku, decimal price)
+    public EmailAddress(string value)
     {
-        Sku = sku;
-        Price = price;
+        if (!value.Contains('@'))
+            throw new ArgumentException("Invalid email", nameof(value));
+        Value = value.ToLowerInvariant();  // normalise on creation
     }
 
-    // IEquatable<T> — efficient typed equality
-    public bool Equals(Product? other)
-        => other is not null && Sku == other.Sku;
+    // Implement IEquatable<T> for typed equality
+    public bool Equals(EmailAddress? other) =>
+        other is not null && Value == other.Value;
 
-    public override bool Equals(object? obj)
-        => obj is Product p && Equals(p);
+    // Override object.Equals for == and Equals(object) calls
+    public override bool Equals(object? obj) => Equals(obj as EmailAddress);
 
-    public override int GetHashCode()
-        => Sku.GetHashCode();
+    // Always override GetHashCode when overriding Equals
+    // Rule: objects that are Equal MUST have the same hash code
+    public override int GetHashCode() => Value.GetHashCode();
 
-    public static bool operator ==(Product? a, Product? b) => a?.Equals(b) ?? b is null;
-    public static bool operator !=(Product? a, Product? b) => !(a == b);
-
-    // IComparable<T> — natural ordering
-    public int CompareTo(Product? other)
-        => other is null ? 1 : Price.CompareTo(other.Price);
-
-    public static bool operator <(Product a, Product b)  => a.CompareTo(b) < 0;
-    public static bool operator >(Product a, Product b)  => a.CompareTo(b) > 0;
-    public static bool operator <=(Product a, Product b) => a.CompareTo(b) <= 0;
-    public static bool operator >=(Product a, Product b) => a.CompareTo(b) >= 0;
+    // Operator overloads for natural syntax
+    public static bool operator ==(EmailAddress? a, EmailAddress? b) =>
+        a?.Equals(b) ?? b is null;
+    public static bool operator !=(EmailAddress? a, EmailAddress? b) => !(a == b);
 }
-
-// Custom comparer
-public class ProductByNameComparer : IComparer<Product>
-{
-    public static readonly IComparer<Product> Instance = new ProductByNameComparer();
-    public int Compare(Product? x, Product? y)
-        => StringComparer.OrdinalIgnoreCase.Compare(x?.Sku, y?.Sku);
-}
-
-// Usage
-var products = GetProducts();
-products.Sort(); // by price (IComparable)
-products.Sort(ProductByNameComparer.Instance); // by sku
-var sorted = products.OrderBy(p => p.Price).ThenBy(p => p.Sku).ToList();
 ```
 
 ---
 
-## 5.8 Covariance and Contravariance in OOP
+## 5.8 Covariance and Contravariance
+
+Variance describes how type parameters behave under inheritance. It
+affects collections and delegates in ways that can surprise you.
 
 ```csharp
-// Return type covariance (C# 9+) — override can return more derived type
-public abstract class AnimalFactory
-{
-    public abstract Animal Create();
-}
+// Covariance (out): a more derived type can be used where a base type is expected
+IEnumerable<string> strings = new List<string>();
+IEnumerable<object> objects = strings;  // works because IEnumerable<T> is covariant
 
-public class DogFactory : AnimalFactory
-{
-    public override Dog Create() => new Dog("Rex", 2, "Lab"); // Dog is Animal
-}
-
-// Covariant IEnumerable<out T>
-IEnumerable<Dog> dogs = GetDogs();
-IEnumerable<Animal> animals = dogs; // OK — covariant
-
-// Contravariant IComparer<in T>
-IComparer<Animal> animalComp = Comparer<Animal>.Default;
-IComparer<Dog> dogComp = animalComp; // OK — contravariant
+// Contravariance (in): a less derived type can be used where a more derived is expected
+Action<object>  objectAction = obj => Console.WriteLine(obj);
+Action<string>  stringAction = objectAction;  // works because Action<T> is contravariant
+stringAction("hello");
 ```
 
-> **Rider tip:** *Navigate → Go to Base* (`Ctrl+U` / `⌘U`) and *Navigate → Go to Implementation(s)* (`Ctrl+Alt+B` / `⌘⌥B`) are essential for navigating class hierarchies. The *Type Hierarchy* window (`Ctrl+Alt+H` / `⌘⌥H`) shows the full inheritance tree.
+This matters when you write your own generic interfaces. Declare `out T`
+if the type parameter only appears in return positions (covariant), and
+`in T` if it only appears in input positions (contravariant).
 
-> **VS tip:** *View → Object Browser* shows the full type hierarchy. *Go to Implementation* is `Ctrl+F12`. Use the *Class View* (`Ctrl+Shift+C`) to browse all types in the solution.
+---
 
+## 5.9 The Composition Over Inheritance Principle
 
-> **See also:** [Chapter 20 — Core Design Principles](ch20_principles.md) covers Single Responsibility (§20.7), Composition Over Inheritance (§20.8), and Domain Primitives (§20.10) — all of which build directly on OOP fundamentals.
+Inheritance creates a rigid hierarchy. If `CheckingAccount` inherits from
+`BankAccount`, and you later need a `JointCheckingAccount`, you must either
+create a three-level hierarchy or duplicate code. The deeper the hierarchy,
+the more fragile it becomes.
+
+*Composition* — giving your class references to other objects that
+provide the capabilities it needs — is more flexible:
+
+```csharp
+// Instead of: CheckingAccount inherits BankAccount
+// Composition:
+public class CheckingAccount(
+    IBalanceStore    balance,    // capability: stores and retrieves balance
+    ITransactionLog  log,        // capability: records transactions
+    IOverdraftPolicy overdraft   // capability: decides what happens when overdrawn
+)
+{
+    public decimal Balance => balance.Current;
+
+    public void Withdraw(decimal amount)
+    {
+        if (amount > Balance)
+            overdraft.Handle(this, amount);  // policy is swappable
+        balance.Deduct(amount);
+        log.Record(new Transaction(amount, TransactionType.Withdrawal));
+    }
+}
+```
+
+Now `CheckingAccount` has no inheritance at all. Its behaviour is composed
+from injected capabilities. Changing the overdraft policy is just
+registering a different `IOverdraftPolicy` in DI — no class hierarchy
+changes needed. This is Chapter 6's principle "Composition Over Inheritance"
+and Chapter 18's entire architectural approach.
+
+---
+
+## 5.10 Connecting OOP to the Rest of the Book
+
+- **Ch 6 (Principles)** — "Composition Over Inheritance" (§6.8) and
+  "Single Responsibility" (§6.7) are OOP principles. The chapter explains
+  what goes wrong when they are violated.
+- **Ch 10–11 (DI)** — The entire DI system is built on interfaces.
+  You register an interface and its implementation; the container
+  constructs the implementation and injects it wherever the interface
+  is requested.
+- **Ch 17 (Testing)** — Interfaces enable test doubles (mocks, fakes,
+  stubs). Without them, unit testing requires the real implementation
+  of every dependency.
+- **Ch 18 (Architectures)** — Onion, Clean, and Hexagonal architectures
+  are all about which layer can depend on which. Interfaces are the
+  mechanism that enforces those dependency rules.
+- **Ch 29 (Design Patterns)** — Strategy, Decorator, Factory, and
+  Repository all depend on interfaces to express their shape.

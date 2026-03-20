@@ -1,583 +1,563 @@
 # Chapter 7 — Collections & LINQ
 
-## 7.1 Array
+> Data structures are the first design decision in any algorithm: the
+> wrong container makes simple problems expensive. LINQ is the uniform
+> query language that works over all of them. Together they form the
+> vocabulary for expressing what you want from data. This chapter
+> explains the mental model behind each collection type, when to reach
+> for it, and how LINQ turns querying into a composable pipeline.
+
+*Building on:* Ch 2 (generics — all collections are generic types),
+Ch 3 (pattern matching, `foreach`), Ch 4 (lambdas — every LINQ operator
+takes a `Func<T,…>` argument)
+
+---
+
+## 7.1 The Mental Model: Choosing a Container
+
+The question is not "what does this collection do" but "what invariant
+does it maintain for me". Each collection trades memory or CPU for a
+guarantee:
+
+| Container | Guarantee | Typical use |
+|---|---|---|
+| `T[]` | Fixed size, O(1) random access | Raw performance, fixed-size buffers |
+| `List<T>` | Dynamic size, O(1) amortised append | General-purpose ordered sequence |
+| `Dictionary<K,V>` | O(1) lookup by key | Index, cache, group-by results |
+| `HashSet<T>` | O(1) membership test, no duplicates | Deduplication, set operations |
+| `SortedDictionary<K,V>` | O(log n) lookup, keys always sorted | Sorted index |
+| `Queue<T>` | FIFO ordering | Work queues, BFS |
+| `Stack<T>` | LIFO ordering | Undo stacks, DFS, call simulation |
+| `PriorityQueue<T,P>` | O(log n) dequeue of minimum priority | Task scheduling, Dijkstra's |
+| `LinkedList<T>` | O(1) insert/delete at known position | Splice-heavy ordered sequences |
+| `ImmutableList<T>` | Any read, any thread, no mutation | Shared read-only state |
+| `ConcurrentDictionary<K,V>` | Thread-safe read/write | Shared caches, counters |
+
+---
+
+## 7.2 Arrays — The Primitive Foundation
+
+An array (`T[]`) is the most primitive collection. It is a contiguous
+block of memory with a fixed length. All other .NET collections are
+built on top of arrays (or use arrays internally). Its advantages:
+O(1) indexed access, minimal overhead, stack-allocatable for small
+sizes, directly mappable to hardware memory layouts.
+
+Its limitation: the length is fixed at creation. If you need to grow
+the collection, you allocate a new array and copy.
 
 ```csharp
-// Declaration
-int[] arr = new int[5];                    // zero-initialized: [0,0,0,0,0]
-int[] arr2 = new int[] { 1, 2, 3, 4, 5 };
-int[] arr3 = [1, 2, 3, 4, 5];             // collection expression (C# 12+)
+// Fixed-length: set at creation and cannot change
+int[] scores = new int[5];            // [0, 0, 0, 0, 0]
+int[] primes = [2, 3, 5, 7, 11];     // collection expression (C# 12+)
 
-// 2D array (rectangular)
+// O(1) indexed access
+int third = primes[2];                // 5
+primes[0] = 1;                        // mutation
+
+// Bounds: Array.Length, Indices (^), Ranges (..)
+Console.WriteLine(primes.Length);     // 5
+Console.WriteLine(primes[^1]);        // 11 (last element, ^ = from end)
+int[] middle = primes[1..4];          // [3, 5, 7] (range, exclusive end)
+
+// Sorting, searching (mutates in place)
+int[] data = [5, 2, 8, 1, 9];
+Array.Sort(data);                     // [1, 2, 5, 8, 9]
+int idx = Array.BinarySearch(data, 5); // 2 — O(log n) on sorted array
+
+// 2D rectangular array — one block of memory, row×col layout
 int[,] matrix = new int[3, 3];
-int[,] matrix2 = { { 1, 2, 3 }, { 4, 5, 6 }, { 7, 8, 9 } };
-matrix2[1, 1] = 99;
+matrix[0, 1] = 42;
 
-// Jagged array (array of arrays)
-int[][] jagged = new int[3][];
-jagged[0] = [1, 2];
-jagged[1] = [3, 4, 5];
-jagged[2] = [6];
-
-// Common operations
-int[] sorted = [3, 1, 4, 1, 5, 9];
-Array.Sort(sorted);                    // [1,1,3,4,5,9] in-place
-Array.Reverse(sorted);                 // [9,5,4,3,1,1]
-int idx = Array.BinarySearch(sorted, 4); // binary search (must be sorted)
-Array.Fill(sorted, 0);                 // fill with value
-int[] copy = sorted.ToArray();         // copy
-Array.Copy(sorted, copy, sorted.Length);
-
-// Multidimensional with LINQ
-var flat = matrix2.Cast<int>(); // flattens 2D to IEnumerable<int>
+// Jagged array — array of arrays, rows can differ in length
+int[][] jagged = [[1, 2], [3, 4, 5], [6]];
 ```
+
+Use arrays when: the size is known upfront, performance is critical,
+or you're interoperating with native code or low-level APIs.
 
 ---
 
-## 7.2 List\<T\>
+## 7.3 `List<T>` — Dynamic Arrays
+
+`List<T>` wraps an array and grows it automatically. Internally it
+doubles the array's capacity when it runs out of space — an O(n) copy
+that is amortised to O(1) per append. Random access by index is O(1).
+Inserting or removing from the middle is O(n) because elements shift.
+
+`List<T>` is the go-to default collection when you need a sequence of
+unknown size. The vast majority of sequence work in .NET applications
+uses `List<T>` or `IEnumerable<T>` (the read-only view of it).
 
 ```csharp
-var list = new List<int> { 1, 2, 3 };
-var list2 = new List<int>(capacity: 1000); // pre-allocate to avoid resize
+var items = new List<string> { "apple", "banana" };
+var sized = new List<string>(capacity: 1000);  // pre-allocate; avoids resizes for known size
 
-list.Add(4);
-list.AddRange([5, 6, 7]);
-list.Insert(0, 0);          // insert at index
-list.Remove(3);             // removes first occurrence of value 3
-list.RemoveAt(0);           // removes at index
-list.RemoveAll(x => x % 2 == 0); // remove all even numbers
+// O(1) amortised
+items.Add("cherry");
+items.AddRange(["date", "elderberry"]);
 
-bool has = list.Contains(5);
-int pos = list.IndexOf(5);
-int count = list.Count;
+// O(n) — avoid in hot paths
+items.Insert(0, "avocado");     // shifts all elements right
+items.Remove("banana");         // linear scan then shift
+items.RemoveAt(1);              // shift
+items.RemoveAll(s => s.Length > 5); // filter in-place
 
-list.Sort();
-list.Sort((a, b) => b.CompareTo(a)); // reverse sort
-list.Reverse();
+// O(1)
+bool has = items.Contains("cherry");   // linear scan (O(n)) — use HashSet for O(1) membership
+int idx  = items.IndexOf("cherry");    // linear scan
+string   first = items[0];             // O(1) index
 
-var copy = new List<int>(list);  // copy constructor
-var slice = list.GetRange(1, 3); // sublist [1,3) exclusive
+// Sorting: delegates the comparison to you
+items.Sort();                           // natural order (IComparable<T>)
+items.Sort((a, b) => b.Length.CompareTo(a.Length)); // sort by length descending
 
-// Convert
-int[] arr = list.ToArray();
-IReadOnlyList<int> ro = list.AsReadOnly();
-
-// Search
-int found = list.Find(x => x > 3);
-int last   = list.FindLast(x => x > 3);
-List<int> all = list.FindAll(x => x > 3);
-bool any = list.Exists(x => x > 10);
-bool allPos = list.TrueForAll(x => x > 0);
-
-// ForEach
-list.ForEach(x => Console.WriteLine(x));
+// Conversion
+string[] arr   = items.ToArray();   // copy to array
+var      fixed = items.AsReadOnly(); // read-only wrapper, no copy
 ```
+
+When you expose a list from a method, return `IReadOnlyList<T>` or
+`IEnumerable<T>` — this prevents callers from accidentally mutating the
+internal list through the returned reference.
 
 ---
 
-## 7.3 Dictionary\<TKey, TValue\>
+## 7.4 `Dictionary<TKey, TValue>` — Hash-Table Lookup
+
+A `Dictionary<K,V>` maps keys to values with O(1) average lookup, insert,
+and delete. It works by hashing the key to a bucket index — finding an
+entry is usually one hash computation and one memory access, regardless
+of how many entries the dictionary has.
+
+This O(1) guarantee is what makes `Dictionary` the tool for any lookup
+problem: caching computed results, building an index over a list, grouping
+items by category, or deduplicating with associated values.
 
 ```csharp
-var dict = new Dictionary<string, int>
+// Creation
+var ages = new Dictionary<string, int>
 {
     ["Alice"] = 30,
     ["Bob"]   = 25,
 };
+var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+// StringComparer.OrdinalIgnoreCase: "key" and "KEY" are the same key
 
-// Add / update
-dict["Charlie"] = 35;           // add or update
-dict.Add("Dave", 28);           // throws if key exists
-dict.TryAdd("Alice", 99);       // safe add (no throw, returns false if exists)
+// Safe lookup patterns
+if (ages.TryGetValue("Alice", out int age))  // preferred — no double-lookup
+    Console.WriteLine(age);
 
-// Read
-int age = dict["Alice"];        // throws KeyNotFoundException if missing
-int age2 = dict.GetValueOrDefault("Zzz", 0); // safe read
+int val = ages.GetValueOrDefault("Eve", -1); // returns -1 if missing
 
-// TryGetValue — always prefer this for read
-if (dict.TryGetValue("Alice", out int found))
-    Console.WriteLine(found);
+// Insert / update
+ages["Charlie"] = 28;                        // add or overwrite
+ages.TryAdd("Alice", 99);                    // adds only if key is absent; returns false if present
 
-// Remove
-dict.Remove("Dave");
-dict.Remove("Alice", out int removed); // remove and get value
+// Convenient conditional increment
+var wordCount = new Dictionary<string, int>();
+foreach (var word in words)
+    wordCount[word] = wordCount.GetValueOrDefault(word) + 1;
 
 // Iteration
-foreach (var (key, value) in dict)
-    Console.WriteLine($"{key}: {value}");
+foreach (var (name, a) in ages)             // deconstruct KeyValuePair
+    Console.WriteLine($"{name}: {a}");
 
-foreach (var kvp in dict)
-    Console.WriteLine($"{kvp.Key}: {kvp.Value}");
-
-// Keys/Values
-ICollection<string> keys   = dict.Keys;
-ICollection<int>    values = dict.Values;
-
-// Merge / update batch
-foreach (var (k, v) in updates)
-    dict[k] = v;
-
-// Count by frequency
-var freq = new Dictionary<char, int>();
-foreach (var c in "hello world")
-    freq[c] = freq.GetValueOrDefault(c) + 1;
-// Or more elegantly:
-var freq2 = "hello world".GroupBy(c => c).ToDictionary(g => g.Key, g => g.Count());
+// Keys and Values as collections
+IEnumerable<string> names  = ages.Keys;
+IEnumerable<int>    values = ages.Values;
 ```
 
-### Specialized Dictionaries
+The hash function and equality comparer determine performance and
+correctness. Mutable objects as keys are dangerous — if the object's
+`GetHashCode()` result changes after insertion, the entry becomes
+unreachable. Prefer immutable types (strings, ints, records) as keys.
+
+---
+
+## 7.5 `HashSet<T>` — Membership and Set Operations
+
+A `HashSet<T>` stores unique elements and answers "is X in this set?" in
+O(1). It has no order and no associated values — it is a `Dictionary<T,
+unit>`. Use it whenever you care about membership without caring about
+position or associated data.
 
 ```csharp
-// SortedDictionary<TKey, TValue> — O(log n) ops, ordered by key
-var sorted = new SortedDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+var visited = new HashSet<string>();
+visited.Add("page-1");
+visited.Add("page-1");     // duplicate — silently ignored
+Console.WriteLine(visited.Count);  // 1
 
-// SortedList<TKey, TValue> — array-backed, faster read, slower write
-var sortedList = new SortedList<DateTime, string>();
+// O(1) membership — far faster than List.Contains for large sets
+bool seen = visited.Contains("page-1");  // true
+bool notSeen = visited.Contains("page-99");  // false
 
-// OrderedDictionary (NET 9+) — preserves insertion order
-using System.Collections.Generic;
-// Use Dictionary<K,V> — maintains insertion order from NET 5+
+// Mathematical set operations
+var a = new HashSet<int> { 1, 2, 3, 4 };
+var b = new HashSet<int> { 3, 4, 5, 6 };
 
-// ConcurrentDictionary — thread-safe
-var concurrent = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
-concurrent.TryAdd("key", 1);
-concurrent.AddOrUpdate("key", 1, (k, old) => old + 1);
-int val = concurrent.GetOrAdd("key", k => ComputeDefault(k));
+// These MODIFY 'a' in place:
+a.UnionWith(b);        // a = {1,2,3,4,5,6}
+a.IntersectWith(b);    // a = {3,4,5,6}
+a.ExceptWith(b);       // a = {1,2} (elements in a but not b)
+
+// Non-destructive (LINQ):
+var union     = a.Union(b);
+var intersect = a.Intersect(b);
+var except    = a.Except(b);
+```
+
+A common pattern: deduplicate a list while preserving only unique elements.
+
+```csharp
+var deduped = new HashSet<string>(rawList).ToList();
+// or with LINQ:
+var deduped2 = rawList.Distinct().ToList();
 ```
 
 ---
 
-## 7.4 HashSet\<T\> and SortedSet\<T\>
+## 7.6 `Queue<T>`, `Stack<T>`, `PriorityQueue<T,P>`
+
+These are data structures with specific ordering invariants. They are
+less common than `List` or `Dictionary` but indispensable when the
+ordering itself is part of your algorithm.
+
+**`Queue<T>` — First In, First Out (FIFO).** Items are dequeued in the
+order they were enqueued. Use for: work queues where order matters,
+breadth-first graph traversal, event buffers.
 
 ```csharp
-var set = new HashSet<string> { "a", "b", "c" };
-set.Add("d");           // returns false if already exists
-set.Remove("a");
-bool has = set.Contains("b"); // O(1)
-
-// Set operations
-var setA = new HashSet<int> { 1, 2, 3, 4 };
-var setB = new HashSet<int> { 3, 4, 5, 6 };
-
-var union     = new HashSet<int>(setA); union.UnionWith(setB);        // {1,2,3,4,5,6}
-var intersect = new HashSet<int>(setA); intersect.IntersectWith(setB); // {3,4}
-var diff      = new HashSet<int>(setA); diff.ExceptWith(setB);         // {1,2}
-var symDiff   = new HashSet<int>(setA); symDiff.SymmetricExceptWith(setB); // {1,2,5,6}
-
-bool subset   = setA.IsSubsetOf(union);     // true
-bool superset = union.IsSupersetOf(setA);   // true
-
-// Custom equality
-var set2 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-set2.Add("Alice");
-set2.Contains("alice"); // true
-```
-
----
-
-## 7.5 Queue, Stack, LinkedList, PriorityQueue
-
-```csharp
-// Queue<T> — FIFO
 var queue = new Queue<string>();
-queue.Enqueue("first");
-queue.Enqueue("second");
-queue.Enqueue("third");
-string front = queue.Peek();    // "first" — don't remove
-string taken = queue.Dequeue(); // "first" — remove
-bool ok = queue.TryDequeue(out string? item);
+queue.Enqueue("task-1");
+queue.Enqueue("task-2");
+queue.Enqueue("task-3");
 
-// Stack<T> — LIFO
-var stack = new Stack<int>();
-stack.Push(1);
-stack.Push(2);
-stack.Push(3);
-int top = stack.Peek();    // 3
-int popped = stack.Pop();  // 3
-bool ok2 = stack.TryPop(out int x);
+string next = queue.Dequeue();   // "task-1" — the oldest item
+string peek = queue.Peek();      // "task-2" — look without removing
+Console.WriteLine(queue.Count);  // 2
+```
 
-// LinkedList<T> — O(1) insert/remove at ends and known nodes
-var linked = new LinkedList<int>([1, 2, 3]);
-linked.AddFirst(0);
-linked.AddLast(4);
-linked.AddAfter(linked.Find(2)!, 99);
-linked.Remove(99);
-// Good for: sliding window, LRU cache, frequent insert/remove at arbitrary positions
+**`Stack<T>` — Last In, First Out (LIFO).** The most recently added item
+is the first to be removed. Use for: undo history, depth-first traversal,
+expression evaluation, call simulation.
 
-// PriorityQueue<TElement, TPriority> (NET 6+) — min-heap
-var pq = new PriorityQueue<string, int>();
-pq.Enqueue("low priority",    100);
-pq.Enqueue("high priority",   1);
-pq.Enqueue("medium priority", 50);
+```csharp
+var history = new Stack<string>();
+history.Push("action-1");
+history.Push("action-2");
+history.Push("action-3");
 
-while (pq.TryDequeue(out var item, out var priority))
-    Console.WriteLine($"{priority}: {item}");
-// 1: high priority, 50: medium priority, 100: low priority
+string last = history.Pop();     // "action-3" — most recent
+string peek = history.Peek();    // "action-2" — look without removing
+```
 
-// Custom priority comparer (max-heap)
-var maxPq = new PriorityQueue<string, int>(Comparer<int>.Create((a, b) => b.CompareTo(a)));
+**`PriorityQueue<TElement, TPriority>` — Minimum Priority First.**
+Dequeues the element with the lowest priority value first. Implemented
+as a binary min-heap: O(log n) enqueue and dequeue, O(1) peek.
+
+```csharp
+// Task scheduler: lower number = higher priority
+var scheduler = new PriorityQueue<string, int>();
+scheduler.Enqueue("send-email",   priority: 3);
+scheduler.Enqueue("process-payment", priority: 1);
+scheduler.Enqueue("generate-report", priority: 2);
+
+while (scheduler.TryDequeue(out var task, out var priority))
+    Console.WriteLine($"[{priority}] {task}");
+// Output:
+// [1] process-payment
+// [2] generate-report
+// [3] send-email
 ```
 
 ---
 
-## 7.6 Immutable Collections
+## 7.7 Immutable and Concurrent Collections
+
+### Immutable Collections — Safe to Share
+
+The `System.Collections.Immutable` package provides collections that
+cannot be modified after creation. Any "modification" returns a new
+collection sharing structure with the original (persistent data structure).
+They are safe to share across threads without locks because nothing ever
+changes.
 
 ```csharp
 using System.Collections.Immutable;
 
-// ImmutableList<T>
-var list = ImmutableList<int>.Empty;
-var list2 = list.Add(1).Add(2).Add(3);  // each returns new list
-var list3 = list2.Remove(2);
+var list = ImmutableList.Create(1, 2, 3);
+var list2 = list.Add(4);     // NEW list [1,2,3,4] — list is still [1,2,3]
+var list3 = list.Remove(2);  // NEW list [1,3]
 
-// ImmutableDictionary<K,V>
-var dict = ImmutableDictionary<string, int>.Empty;
-var dict2 = dict.Add("a", 1).Add("b", 2);
-var dict3 = dict2.SetItem("a", 99); // update
-
-// ImmutableArray<T> — struct, no allocation overhead for empty
-var arr = ImmutableArray.Create(1, 2, 3);
-
-// Builders — efficient bulk creation
-var builder = ImmutableList.CreateBuilder<int>();
-for (int i = 0; i < 1000; i++) builder.Add(i);
-ImmutableList<int> result = builder.ToImmutable();
+// ImmutableDictionary: safe to share as a read-only snapshot
+var config = ImmutableDictionary.Create<string, string>()
+    .Add("host", "localhost")
+    .Add("port", "5432");
 ```
+
+Use immutable collections when a data structure is shared across threads
+for reading, and updates are infrequent (each update builds a new snapshot).
+
+### Concurrent Collections — Thread-Safe Mutation
+
+When multiple threads need to read and write the same collection without
+external locks, use `System.Collections.Concurrent`:
+
+```csharp
+// ConcurrentDictionary: lock-free reads, fine-grained locking for writes
+var cache = new ConcurrentDictionary<string, User>();
+cache.TryAdd("user-1", new User("Alice"));
+var user = cache.GetOrAdd("user-2", id => LoadFromDatabase(id));
+
+// Atomic compare-and-update
+cache.AddOrUpdate("counter",
+    addValue:       "1",
+    updateValueFactory: (key, old) => (int.Parse(old) + 1).ToString());
+
+// ConcurrentQueue: lock-free enqueue/dequeue
+var events = new ConcurrentQueue<string>();
+events.Enqueue("event-1");
+if (events.TryDequeue(out var evt)) Process(evt);
+```
+
+Chapter 38 covers thread safety and race conditions in depth.
 
 ---
 
-## 7.7 Concurrent Collections
+## 7.8 `Span<T>` and `Memory<T>` — Zero-Copy Slices
+
+`Span<T>` is a stack-only, ref-like type that provides a view over a
+contiguous region of memory without copying it. It can view an array
+slice, a stack allocation, or a block of native memory. It is the tool
+for high-performance code that needs to parse or process data without
+allocating new buffers.
 
 ```csharp
-using System.Collections.Concurrent;
+// Slice an array without copying
+int[] data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+Span<int> middle = data.AsSpan(2, 5);  // elements [3, 4, 5, 6, 7] — no copy
+middle[0] = 99;                         // mutates the original array: data[2] = 99
 
-// ConcurrentQueue<T> — thread-safe FIFO
-var cq = new ConcurrentQueue<string>();
-cq.Enqueue("item");
-cq.TryDequeue(out string? item);
-cq.TryPeek(out string? peeked);
+// Stack allocation: for small buffers, avoid heap allocation entirely
+Span<byte> buffer = stackalloc byte[256];
+int written = Encoding.UTF8.GetBytes("Hello World", buffer);
+// buffer[..written] contains the UTF-8 bytes — no heap allocation
 
-// ConcurrentStack<T> — thread-safe LIFO
-var cs = new ConcurrentStack<int>();
-cs.Push(1);
-cs.TryPop(out int popped);
-cs.PushRange([1, 2, 3]);
-
-// ConcurrentBag<T> — unordered, optimized for same-thread add/take
-var bag = new ConcurrentBag<int>();
-bag.Add(1);
-bag.TryTake(out int taken);
-
-// BlockingCollection<T> — producer/consumer with blocking
-var bc = new BlockingCollection<int>(boundedCapacity: 100);
-
-// Producer
-Task.Run(() => {
-    for (int i = 0; i < 10; i++) bc.Add(i);
-    bc.CompleteAdding();
-});
-
-// Consumer
-foreach (var item in bc.GetConsumingEnumerable())
-    Console.WriteLine(item);
+// Parsing without allocating substrings
+ReadOnlySpan<char> text = "2024-01-15".AsSpan();
+int year  = int.Parse(text[..4]);   // "2024" — no string allocation
+int month = int.Parse(text[5..7]);  // "01"
+int day   = int.Parse(text[8..]);   // "15"
 ```
+
+`Memory<T>` is the heap-compatible sibling — it can be stored in fields
+and used in async methods (where `Span<T>` is restricted to synchronous
+code because it cannot cross an `await`).
+
+Chapter 26 covers the memory management picture in detail; Spans are a
+key part of reducing GC pressure in high-throughput code.
 
 ---
 
-## 7.8 Span\<T\> and Memory\<T\>
+## 7.9 LINQ — Querying Any Sequence
 
+LINQ (Language Integrated Query) is a set of extension methods on
+`IEnumerable<T>` (and `IQueryable<T>`) that lets you express data
+transformations as composable method chains. It was inspired by
+functional languages and SQL. It is one of the features that makes C#
+distinctively expressive compared to most other languages.
+
+### The Mental Model: Lazy Pipelines
+
+LINQ operators do not execute immediately. They build a pipeline description.
+The pipeline runs when you *materialize* it with a terminal operator
+(`ToList()`, `ToArray()`, `First()`, `Count()`, `Sum()`, etc.). Until
+then, no work is done.
+
+```
+source.Where(pred).Select(proj).OrderBy(key).Take(10)
+                                                      ↑
+                               Nothing runs yet.      │
+                                                      │
+.ToList()  ← materialise here. NOW it reads the source, filters, projects, sorts, takes.
+```
+
+This laziness is what allows LINQ to compose with infinite sequences,
+database queries (EF Core), and any custom source — the operators just
+describe *what* to do, not *when*.
+
+### The Core Operators
+
+**Filtering:**
 ```csharp
-// Span<T> — stack-only, slice over arrays/stack memory without allocation
-int[] arr = [1, 2, 3, 4, 5];
-Span<int> span = arr.AsSpan();
-Span<int> slice = span[1..4];  // [2,3,4] — no allocation
+var adults = people.Where(p => p.Age >= 18);
+var first  = people.First(p => p.Name == "Alice");   // throws if not found
+var maybe  = people.FirstOrDefault(p => p.Name == "Bob"); // null if not found
+bool any   = people.Any(p => p.IsAdmin);
+bool all   = people.All(p => p.Age > 0);
+int count  = people.Count(p => p.IsActive);
+```
 
-// Modify through span modifies original array
-slice[0] = 99;
-Console.WriteLine(arr[1]); // 99
+**Projection (transformation):**
+```csharp
+var names    = people.Select(p => p.Name);
+var fullInfo = people.Select(p => new { p.Name, p.Age, IsAdult = p.Age >= 18 });
 
-// stackalloc
-Span<byte> stack = stackalloc byte[256];
-stack.Fill(0);
+// SelectMany: flatten a sequence of sequences
+var allTags  = posts.SelectMany(p => p.Tags);  // each post has many tags
+```
 
-// ReadOnlySpan<T>
-ReadOnlySpan<char> text = "hello, world".AsSpan();
-ReadOnlySpan<char> word = text[..5]; // "hello" — no allocation
+**Ordering:**
+```csharp
+var sorted    = people.OrderBy(p => p.LastName).ThenBy(p => p.FirstName);
+var youngest  = people.OrderBy(p => p.Age).First();
+var oldest    = people.MaxBy(p => p.Age);  // .NET 6+ — no materialise needed
+```
 
-// Memory<T> — heap-safe wrapper, can be stored in fields and passed to async
-Memory<byte> mem = new byte[1024];
-Memory<byte> slice2 = mem.Slice(0, 512);
-
-// In async context (Span can't be used across await)
-async Task ProcessAsync(Memory<byte> data)
+**Grouping:**
+```csharp
+// Group people by country; result is IGrouping<string, Person>
+var byCountry = people.GroupBy(p => p.Country);
+foreach (var group in byCountry)
 {
-    await Task.Delay(1);
-    data.Span.Fill(0xFF);
+    Console.WriteLine($"{group.Key}: {group.Count()} people");
+    foreach (var person in group)
+        Console.WriteLine($"  {person.Name}");
 }
+
+// Group and project in one step
+var summary = people
+    .GroupBy(p => p.Department)
+    .Select(g => new
+    {
+        Department  = g.Key,
+        Count       = g.Count(),
+        AverageSalary = g.Average(p => p.Salary),
+    });
 ```
 
----
-
-## 7.9 LINQ — Complete Operator Reference
-
-### Standard Query Operators
-
+**Aggregation:**
 ```csharp
-var nums = Enumerable.Range(1, 20).ToList();
+decimal total  = orders.Sum(o => o.Total);
+decimal avg    = orders.Average(o => o.Total);
+decimal max    = orders.Max(o => o.Total);
+decimal min    = orders.Min(o => o.Total);
 
-// ── Filtering ─────────────────────────────────────────────────────────
-var evens  = nums.Where(n => n % 2 == 0);
-var first  = nums.First(n => n > 10);       // throws if none
-var firstN = nums.FirstOrDefault(n => n > 100); // null/0 if none
-var last   = nums.Last(n => n % 2 == 0);
-var lastN  = nums.LastOrDefault(n => n > 100);
-var single = nums.Single(n => n == 10);     // throws if 0 or 2+ matches
-var singleN = nums.SingleOrDefault(n => n == 999); // throws if 2+ matches
+// Aggregate: custom accumulator (like fold/reduce)
+string sentence = words.Aggregate("", (acc, word) => acc == "" ? word : acc + " " + word);
+```
 
-// ── Projection ────────────────────────────────────────────────────────
-var squares  = nums.Select(n => n * n);
-var asStrings = nums.Select((n, i) => $"[{i}] {n}"); // index overload
-var flat     = new[] { new[]{1,2}, new[]{3,4} }.SelectMany(x => x); // [1,2,3,4]
+**Set operations:**
+```csharp
+var union     = listA.Union(listB);           // distinct union
+var intersect = listA.Intersect(listB);       // common elements
+var except    = listA.Except(listB);          // in A but not B
+var distinct  = list.Distinct();              // remove duplicates
+```
 
-// ── Ordering ──────────────────────────────────────────────────────────
-var asc   = nums.OrderBy(n => n);
-var desc  = nums.OrderByDescending(n => n);
-var multi = words.OrderBy(w => w.Length).ThenBy(w => w); // stable multi-key sort
-var rev   = nums.Reverse();
+**Joining:**
+```csharp
+// Join on a key — like SQL INNER JOIN
+var joined = orders.Join(
+    customers,
+    order    => order.CustomerId,
+    customer => customer.Id,
+    (order, customer) => new { order.Id, customer.Name, order.Total });
 
-// ── Grouping ──────────────────────────────────────────────────────────
-var groups = nums.GroupBy(n => n % 3);
-foreach (var g in groups)
-{
-    Console.WriteLine($"Key {g.Key}: {string.Join(",", g)}");
-}
-
-// Group into dictionary
-var byRemainder = nums.GroupBy(n => n % 3)
-                      .ToDictionary(g => g.Key, g => g.ToList());
-
-// ── Joining ───────────────────────────────────────────────────────────
-var users   = GetUsers();
-var orders  = GetOrders();
-
-// Inner join
-var joined = users.Join(
+// GroupJoin — like SQL LEFT JOIN
+var withOrders = customers.GroupJoin(
     orders,
-    u => u.Id,
-    o => o.UserId,
-    (u, o) => new { u.Name, o.Total });
-
-// Left outer join via GroupJoin + SelectMany
-var leftJoin = users.GroupJoin(
-    orders,
-    u => u.Id,
-    o => o.UserId,
-    (u, userOrders) => new { User = u, Orders = userOrders })
-    .SelectMany(
-        x => x.Orders.DefaultIfEmpty(),
-        (x, o) => new { x.User.Name, OrderTotal = o?.Total ?? 0 });
-
-// ── Set operations ────────────────────────────────────────────────────
-var a = new[] { 1, 2, 3, 4 };
-var b = new[] { 3, 4, 5, 6 };
-var union     = a.Union(b);          // [1,2,3,4,5,6] — distinct
-var intersect = a.Intersect(b);      // [3,4]
-var diff      = a.Except(b);         // [1,2]
-var distinct  = a.Distinct();
-var distinctBy = users.DistinctBy(u => u.Email); // (NET 6+)
-
-// ── Aggregation ───────────────────────────────────────────────────────
-int count    = nums.Count();
-int countIf  = nums.Count(n => n % 2 == 0);
-long lcount  = nums.LongCount();
-int sum      = nums.Sum();
-double avg   = nums.Average();
-int min      = nums.Min();
-int max      = nums.Max();
-int? minN    = nums.MinOrDefault();  // null if empty (NET 6+)
-
-// Aggregate — custom fold
-int product = nums.Aggregate(1, (acc, n) => acc * n);
-string joined = nums.Aggregate("", (acc, n) => acc + n + ",");
-
-// ── Quantifiers ───────────────────────────────────────────────────────
-bool any    = nums.Any();              // not empty
-bool anyIf  = nums.Any(n => n > 15);
-bool all    = nums.All(n => n > 0);
-bool none   = !nums.Any(n => n < 0);
-bool has    = nums.Contains(10);
-
-// ── Element access ────────────────────────────────────────────────────
-int elem     = nums.ElementAt(5);
-int elemN    = nums.ElementAtOrDefault(999); // 0 if out of range
-int elemN2   = nums.ElementAtOrDefault(^1);  // last element (NET 6+)
-
-// ── Partitioning ──────────────────────────────────────────────────────
-var skipped  = nums.Skip(5);
-var taken    = nums.Take(5);
-var page     = nums.Skip(10).Take(10);     // page 2 of 10
-var takenRng = nums.Take(3..7);            // range (NET 6+)
-var skipLast = nums.SkipLast(3);           // [1..17]
-var takeLast = nums.TakeLast(3);           // [18,19,20]
-var skipWhile = nums.SkipWhile(n => n < 5); // skip while predicate true
-var takeWhile = nums.TakeWhile(n => n < 5); // take while predicate true
-
-// ── Conversion ────────────────────────────────────────────────────────
-List<int> toList       = nums.ToList();
-int[]     toArr        = nums.ToArray();
-HashSet<int> toSet     = nums.ToHashSet();
-Dictionary<int, string> toDict = nums.ToDictionary(n => n, n => n.ToString());
-ILookup<int, int> lookup = nums.ToLookup(n => n % 3); // like GroupBy but lookup-optimized
-```
-
-### Query Syntax (SQL-like)
-
-```csharp
-var query = from u in users
-            join o in orders on u.Id equals o.UserId
-            where u.Age >= 18 && o.Total > 100
-            orderby o.Total descending, u.Name
-            group new { u, o } by u.Country into g
-            select new
-            {
-                Country = g.Key,
-                TotalRevenue = g.Sum(x => x.o.Total),
-                UserCount = g.Select(x => x.u.Id).Distinct().Count()
-            };
-```
-
-### Deferred Execution
-
-```csharp
-// LINQ queries are lazy — they don't execute until enumerated
-var q = nums.Where(n => n % 2 == 0).Select(n => n * n);
-// q is just a query definition — no work done yet
-
-nums.Add(22); // add to source AFTER defining query
-var result = q.ToList(); // NOW it executes — includes 22!
-
-// Force immediate evaluation with ToList/ToArray/ToDictionary
-var immediate = nums.Where(n => n % 2 == 0).ToList(); // evaluated now
-nums.Add(24); // too late — not in result
-```
-
-### LINQ Performance Tips
-
-```csharp
-// 1. Avoid multiple enumeration
-var items = GetExpensiveItems();
-// BAD:
-if (items.Any()) Console.WriteLine(items.Count()); // enumerates twice
-// GOOD:
-var list = items.ToList();
-if (list.Count > 0) Console.WriteLine(list.Count);
-
-// 2. Use Where before Select
-// BAD:
-var result1 = items.Select(x => ComputeExpensive(x)).Where(x => x > 0);
-// GOOD:
-var result2 = items.Where(x => x.IsValid).Select(x => ComputeExpensive(x));
-
-// 3. Short-circuit with Any/First instead of Count/Where+First
-// BAD:
-bool hasAny = items.Where(x => x.IsActive).Count() > 0;
-// GOOD:
-bool hasAny2 = items.Any(x => x.IsActive);
-
-// 4. For large sorted datasets, use OrderBy once
-var ordered = items.OrderBy(x => x.Name);
-var top10 = ordered.Take(10).ToList();
-var next10 = ordered.Skip(10).Take(10).ToList();
-
-// 5. Chunk (NET 6+) — batch processing
-foreach (var chunk in items.Chunk(100))
-{
-    await ProcessBatchAsync(chunk); // chunk is int[]
-}
-```
-
-### Custom LINQ Operators
-
-```csharp
-public static class LinqExtensions
-{
-    // Batch/chunk (before NET 6)
-    public static IEnumerable<IReadOnlyList<T>> Batch<T>(this IEnumerable<T> source, int size)
+    customer => customer.Id,
+    order    => order.CustomerId,
+    (customer, customerOrders) => new
     {
-        var batch = new List<T>(size);
-        foreach (var item in source)
-        {
-            batch.Add(item);
-            if (batch.Count == size)
-            {
-                yield return batch.AsReadOnly();
-                batch = new List<T>(size);
-            }
-        }
-        if (batch.Count > 0) yield return batch.AsReadOnly();
-    }
-
-    // Tap — peek at each element without changing the stream
-    public static IEnumerable<T> Tap<T>(this IEnumerable<T> source, Action<T> action)
-    {
-        foreach (var item in source)
-        {
-            action(item);
-            yield return item;
-        }
-    }
-
-    // ZipWith — pair two sequences
-    public static IEnumerable<(T1, T2)> ZipWith<T1, T2>(
-        this IEnumerable<T1> first,
-        IEnumerable<T2> second)
-        => first.Zip(second);
-
-    // Flatten one level of nesting
-    public static IEnumerable<T> Flatten<T>(this IEnumerable<IEnumerable<T>> source)
-        => source.SelectMany(x => x);
-
-    // MinBy/MaxBy (NET 6+ built-in, but shown for reference)
-    public static T? MinBy<T, TKey>(this IEnumerable<T> source, Func<T, TKey> key)
-        where TKey : IComparable<TKey>
-    {
-        T? min = default;
-        TKey? minKey = default;
-        bool first = true;
-        foreach (var item in source)
-        {
-            var k = key(item);
-            if (first || k.CompareTo(minKey!) < 0) { min = item; minKey = k; first = false; }
-        }
-        return min;
-    }
-}
+        customer.Name,
+        OrderCount = customerOrders.Count(),
+        TotalSpent  = customerOrders.Sum(o => o.Total),
+    });
 ```
 
-### LINQ to XML
+**Paging:**
+```csharp
+int pageSize   = 20;
+int pageNumber = 3;
+var page = items
+    .Skip(pageNumber * pageSize)  // skip first N pages
+    .Take(pageSize)               // take one page
+    .ToList();
+```
+
+**Materialisation (terminal operators):**
+```csharp
+List<T>        toList    = query.ToList();
+T[]            toArray   = query.ToArray();
+HashSet<T>     toHashSet = query.ToHashSet();
+Dictionary<K,V> toDict   = query.ToDictionary(x => x.Key, x => x.Value);
+```
+
+### Query Syntax vs. Method Syntax
+
+LINQ has two syntaxes. The compiler translates query syntax into method
+syntax — they produce identical IL. Method syntax is more commonly used
+in C# (as opposed to VB.NET), but query syntax is clearer for complex joins:
 
 ```csharp
-using System.Xml.Linq;
+// Query syntax (SQL-like)
+var result =
+    from order in orders
+    where order.Total > 100
+    join customer in customers on order.CustomerId equals customer.Id
+    orderby order.Total descending
+    select new { customer.Name, order.Total };
 
-var xml = XDocument.Load("data.xml");
-
-// Query XML with LINQ
-var names = xml.Descendants("user")
-               .Where(u => (int)u.Attribute("age")! > 18)
-               .Select(u => (string)u.Element("name")!)
-               .ToList();
-
-// Build XML
-var doc = new XDocument(
-    new XElement("users",
-        new XElement("user",
-            new XAttribute("id", 1),
-            new XElement("name", "Alice"),
-            new XElement("age", 30))));
-
-doc.Save("output.xml");
+// Equivalent method syntax
+var result2 = orders
+    .Where(o => o.Total > 100)
+    .Join(customers, o => o.CustomerId, c => c.Id,
+          (o, c) => new { c.Name, o.Total })
+    .OrderByDescending(x => x.Total);
 ```
 
-> **Rider tip:** Rider shows LINQ complexity hints inline — it marks chains that enumerate multiple times with a warning. Use *Code → Optimize Imports and Code Cleanup* to apply LINQ-specific inspections.
+---
 
-> **VS tip:** Install *LINQPad-style* execution via *dotnet-script* or use the *C# Interactive* window (`View → Other Windows → C# Interactive`) to test LINQ queries in real time.
+## 7.10 `IEnumerable<T>` vs `IQueryable<T>` — Where Execution Happens
 
+This distinction is one of the most important things to understand when
+working with databases (Chapter 15):
+
+- `IEnumerable<T>` executes in your process. Every LINQ operator runs in
+  C#, over data already in memory.
+
+- `IQueryable<T>` builds an expression tree (Ch 4 §4.7). A provider
+  (EF Core, for example) translates it to SQL and executes it in the
+  database. Only the result rows arrive in memory.
+
+```csharp
+// IEnumerable: loads ALL orders then filters in .NET — expensive!
+var pending = db.Orders.ToList()  // materialise entire table
+    .Where(o => o.Status == "pending"); // filter in C#
+
+// IQueryable: SQL is "SELECT * FROM orders WHERE status = 'pending'" — efficient
+var pending2 = db.Orders           // IQueryable
+    .Where(o => o.Status == "pending")  // added to expression tree
+    .ToList();                          // NOW executes: sends SQL to DB, gets only matching rows
+```
+
+The detailed treatment of this distinction is in Chapter 15 §15.12.
+
+---
+
+## 7.11 Connecting Collections and LINQ to the Rest of the Book
+
+- **Ch 8 (Async)** — `IAsyncEnumerable<T>` extends the sequence model
+  to async sources. `await foreach` is `foreach` for async streams.
+- **Ch 14 (ASP.NET Core)** — Pagination, filtering, and sorting in API
+  endpoints all use LINQ operators over `IQueryable<T>`.
+- **Ch 15 (EF Core)** — EF Core implements `IQueryable<T>`. Every LINQ
+  chain you write against `DbSet<T>` becomes SQL.
+- **Ch 26 (Memory)** — `Span<T>`, `Memory<T>`, and `ArrayPool<T>` are
+  the tools for avoiding collections allocations on hot paths.
+- **Ch 38 (Multithreading)** — `ConcurrentDictionary`, `ConcurrentQueue`,
+  and `ImmutableDictionary` from this chapter are the thread-safe
+  collection tools explored in the concurrency projects.
