@@ -1,0 +1,585 @@
+# ============================================================
+# .editorconfig — Strict C# / .NET Code Style
+# Place at the solution root. Applies to all projects.
+#
+# How this works:
+#   Editors (Rider, VS, VS Code) read this file and apply
+#   formatting + naming rules automatically.
+#   `dotnet format` uses this to fix violations on the CLI.
+#   Roslyn analyzers enforce rules at build time.
+#
+# Severity levels used throughout:
+#   error    → build fails, CI blocks the PR
+#   warning  → visible squiggle, shown in Problems panel
+#   suggestion → shown as a hint, dimmed text
+#   silent   → rule is evaluated but never shown
+#   none     → rule is disabled
+#
+# To apply from CLI:
+#   dotnet format                          # fix all auto-fixable violations
+#   dotnet format --verify-no-changes      # CI gate: fail if any violations
+#   dotnet format --diagnostics IDE0001    # fix specific rule
+# ============================================================
+
+root = true
+
+# ============================================================
+# Universal — applies to every file in the repo
+# ============================================================
+[*]
+
+# Indentation
+# Options: space | tab
+# "space" is the universal default for .NET projects.
+# "tab" saves bytes and respects user tab-width preferences,
+# but causes misalignment when mixed with space-indented code.
+indent_style = space
+
+# Tab width when indent_style = tab (also used for display)
+# 4 is the .NET / C# convention. Python uses 4. JS/TS typically 2.
+indent_size = 4
+
+# End of line character
+# Options: lf | crlf | cr
+# "lf" (Unix) is the modern standard even on Windows projects.
+# "crlf" is needed if you have tooling that requires Windows line endings.
+# Commit with lf; configure git: `git config core.autocrlf input`
+end_of_line = lf
+
+# Character encoding
+# Options: utf-8 | utf-8-bom | utf-16be | utf-16le | latin1
+# utf-8 everywhere. BOM causes problems with Unix tools and bash scripts.
+# Only add BOM for legacy Windows tooling that requires it.
+charset = utf-8
+
+# Remove trailing spaces at end of lines
+# false only for Markdown where trailing spaces create line breaks (see below)
+trim_trailing_whitespace = true
+
+# Every file ends with a newline character
+# POSIX standard. Many Unix tools require this. Git shows "no newline at end"
+# warnings without it.
+insert_final_newline = true
+
+# ============================================================
+# Markdown — exceptions to universal rules
+# ============================================================
+[*.md]
+
+# Markdown uses trailing spaces for <br> line breaks
+# Keep false here or your intentional line breaks will disappear
+trim_trailing_whitespace = false
+
+# ============================================================
+# JSON / YAML / TOML — smaller indent for config files
+# ============================================================
+[*.{json,jsonc}]
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.toml]
+indent_size = 2
+
+# ============================================================
+# XML — project files, config, NuGet
+# ============================================================
+[*.{xml,csproj,props,targets,config,resx,nuspec}]
+indent_size = 2
+
+# ============================================================
+# Shell scripts — always LF, never CRLF
+# ============================================================
+[*.{sh,bash,fsx,csx}]
+end_of_line = lf
+
+# ============================================================
+# C# — the main event
+# ============================================================
+[*.cs]
+indent_size = 4
+tab_width   = 4
+
+# ── Language: var vs explicit type ───────────────────────────────────
+#
+# "var" for built-in types: off
+#   int x = 5;  NOT  var x = 5;
+#   Makes the type immediately visible without hovering.
+#   Options: true | false
+csharp_style_var_for_built_in_types = false:suggestion
+
+# "var" when the type is apparent from the right-hand side: on
+#   var list = new List<string>();   ← type is obvious
+#   var conn = new SqlConnection();  ← type is obvious
+#   Options: true | false
+csharp_style_var_when_type_is_apparent = true:suggestion
+
+# "var" in all other cases: off
+#   Prefer explicit type when it aids readability
+#   Options: true | false
+csharp_style_var_elsewhere = false:suggestion
+
+# ── Expression bodies (=> shorthand) ─────────────────────────────────
+#
+# For single-expression methods and properties:
+#   public string Name => _name;     ← preferred
+#   public string Name { get { return _name; } }  ← verbose
+#
+# Options: true | false | when_on_single_line
+# "when_on_single_line" only uses => if it fits on one line
+
+csharp_style_expression_bodied_methods         = when_on_single_line:suggestion
+csharp_style_expression_bodied_constructors    = false:suggestion
+# Constructors with complex logic should use block bodies for clarity
+csharp_style_expression_bodied_operators       = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties      = true:suggestion
+csharp_style_expression_bodied_indexers        = true:suggestion
+csharp_style_expression_bodied_accessors       = true:suggestion
+csharp_style_expression_bodied_lambdas         = when_on_single_line:suggestion
+csharp_style_expression_bodied_local_functions = when_on_single_line:suggestion
+
+# ── Pattern matching ──────────────────────────────────────────────────
+#
+# Prefer pattern matching over is + cast:
+#   if (obj is string s)   NOT   if (obj is string) { var s = (string)obj; }
+csharp_style_pattern_matching_over_is_with_cast_check  = true:warning
+csharp_style_pattern_matching_over_as_with_null_check  = true:warning
+
+# Prefer switch expression over switch statement where applicable
+# Options: true | false
+csharp_style_prefer_switch_expression = true:suggestion
+
+# Prefer pattern matching for null checks
+# if (x is null)  NOT  if (x == null)
+csharp_style_prefer_null_check_over_type_check = true:suggestion
+
+# ── Null handling ─────────────────────────────────────────────────────
+#
+# Prefer null propagation: x?.Length  NOT  x == null ? null : x.Length
+dotnet_style_null_propagation = true:warning
+
+# Prefer null coalescing: x ?? default  NOT  x != null ? x : default
+dotnet_style_coalesce_expression = true:warning
+
+# Prefer null-coalescing assignment: x ??= default  NOT  if (x == null) x = default
+dotnet_style_prefer_null_coalescing_assignment = true:suggestion
+
+# ── Inlining and simplification ───────────────────────────────────────
+
+# Prefer inlined variable declarations: out var result  NOT  int result; ... out result
+csharp_style_inlined_variable_declaration = true:suggestion
+
+# Prefer simple using declarations (C# 8+):
+#   using var conn = new SqlConnection();   NOT   using (var conn = ...) { }
+csharp_style_prefer_simple_using_statement = true:suggestion
+
+# Prefer tuple swap:  (a, b) = (b, a)  NOT  var temp = a; a = b; b = temp;
+csharp_style_prefer_tuple_swap = true:suggestion
+
+# Prefer range operator:  arr[1..3]  NOT  arr.Skip(1).Take(2)
+csharp_style_prefer_range_operator = true:suggestion
+
+# Prefer index operator:  arr[^1]  NOT  arr[arr.Length - 1]
+csharp_style_prefer_index_operator = true:suggestion
+
+# ── Object/collection initializers ───────────────────────────────────
+
+# var x = new Foo { Bar = 1 };  NOT  var x = new Foo(); x.Bar = 1;
+dotnet_style_object_initializer = true:suggestion
+
+# var list = new List<int> { 1, 2, 3 };  NOT  var list = new...; list.Add(1)...
+dotnet_style_collection_initializer = true:suggestion
+
+# Prefer simplified collection expressions (C# 12+):
+#   int[] arr = [1, 2, 3];  NOT  int[] arr = new int[] { 1, 2, 3 };
+dotnet_style_prefer_collection_expression = when_types_loosely_match:suggestion
+
+# ── Braces ────────────────────────────────────────────────────────────
+#
+# Always require braces for control flow blocks.
+# "omit_if_single_line" is tempting but causes bugs:
+#   if (condition)
+#       DoA();   ← looks guarded
+#   DoB();       ← runs always. Classic mistake.
+#
+# Options: always | omit_if_single_line | when_multiline
+csharp_prefer_braces = true:warning
+
+# Static local functions: prevents accidental capture of outer variables
+csharp_prefer_static_local_function = true:suggestion
+
+# Simple default expression: default  NOT  default(int)
+csharp_prefer_simple_default_expression = true:suggestion
+
+# ── Spacing ───────────────────────────────────────────────────────────
+
+# Space before open paren of method call: false
+# Method()  NOT  Method ()
+csharp_space_before_open_square_brackets = false
+csharp_space_between_empty_square_brackets = false
+csharp_space_between_square_brackets = false
+
+# Space after cast: false
+# (int)x  NOT  (int) x
+csharp_space_after_cast = false
+
+# Spaces inside parentheses: false
+# f(x)  NOT  f( x )
+csharp_space_between_parentheses = false
+
+# ── New lines ─────────────────────────────────────────────────────────
+
+# Opening brace on new line (Allman style) — the .NET standard
+# Options: true (Allman)  |  false (K&R, same line)
+csharp_new_line_before_open_brace = all
+
+# else, catch, finally on new line
+csharp_new_line_before_else    = true
+csharp_new_line_before_catch   = true
+csharp_new_line_before_finally = true
+
+# Members of object initializers on new lines when multiple:
+# new Foo                      NOT  new Foo { X = 1, Y = 2 }
+# {
+#     X = 1,
+#     Y = 2,
+# }
+csharp_new_line_before_members_in_object_initializers = true
+
+# Members of anonymous types on new lines
+csharp_new_line_before_members_in_anonymous_types = true
+
+# ── Indentation ───────────────────────────────────────────────────────
+
+# Indent switch case contents
+csharp_indent_case_contents             = true
+csharp_indent_switch_labels             = true
+csharp_indent_case_contents_when_block  = true
+
+# Indent block contents
+csharp_indent_block_contents = true
+
+# ── Wrapping ──────────────────────────────────────────────────────────
+
+# Keep simple statements on one line: if (x) return y;
+csharp_preserve_single_line_statements = false
+# false forces all statements onto their own line — more readable in diffs
+
+# Keep simple blocks on one line: { return x; }
+csharp_preserve_single_line_blocks = true
+
+# ── Modifiers ─────────────────────────────────────────────────────────
+
+# Require accessibility modifiers on all declarations
+# Options: always | for_non_interface_members | never | omit_if_default
+dotnet_style_require_accessibility_modifiers = always:warning
+# Makes intent explicit — you see "public" and know it's public API surface
+
+# Order modifiers consistently
+# The standard .NET order:
+dotnet_style_readonly_field = true:suggestion
+# Mark fields readonly when they're only set in constructor — signals immutability
+
+# Preferred modifier order (Roslyn enforces this)
+csharp_preferred_modifier_order = public, private, protected, internal, file, static, extern, new, virtual, abstract, sealed, override, readonly, unsafe, required, volatile, async:warning
+
+# ── Naming — the most important style rules ───────────────────────────
+#
+# Enforced naming rules. All set to warning so they appear in Problems
+# but don't break the build. Set to error in strict CI environments.
+
+# ── Symbols: define what applies to what ─────────────────────────────
+
+dotnet_naming_symbols.public_members.applicable_kinds            = property, method, field, event, delegate
+dotnet_naming_symbols.public_members.applicable_accessibilities  = public, internal, protected, protected_internal
+
+dotnet_naming_symbols.private_fields.applicable_kinds            = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities  = private, private_protected
+
+dotnet_naming_symbols.constants.applicable_kinds                 = field
+dotnet_naming_symbols.constants.required_modifiers               = const
+
+dotnet_naming_symbols.static_fields.applicable_kinds             = field
+dotnet_naming_symbols.static_fields.required_modifiers           = static
+
+dotnet_naming_symbols.interfaces.applicable_kinds                = interface
+
+dotnet_naming_symbols.type_params.applicable_kinds               = type_parameter
+
+dotnet_naming_symbols.local_variables.applicable_kinds           = local, parameter
+
+dotnet_naming_symbols.async_methods.applicable_kinds             = method
+dotnet_naming_symbols.async_methods.required_modifiers           = async
+
+# ── Styles: define what the names look like ───────────────────────────
+
+# PascalCase: MyClass, MyMethod, MyProperty
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+
+# camelCase: myVariable, myParameter
+dotnet_naming_style.camel_case.capitalization = camel_case
+
+# _camelCase: _myField  (underscore prefix for private fields)
+# Alternatives: m_myField (Hungarian, discouraged), myField (no prefix),
+#               this.myField (forced disambiguation, verbose)
+dotnet_naming_style.underscore_camel.capitalization   = camel_case
+dotnet_naming_style.underscore_camel.required_prefix  = _
+
+# I prefix for interfaces: IMyInterface
+dotnet_naming_style.interface_style.capitalization   = pascal_case
+dotnet_naming_style.interface_style.required_prefix  = I
+
+# T prefix for type parameters: TKey, TValue, TResult
+dotnet_naming_style.type_param_style.capitalization  = pascal_case
+dotnet_naming_style.type_param_style.required_prefix = T
+
+# Async suffix for async methods: GetUserAsync
+dotnet_naming_style.async_style.capitalization       = pascal_case
+dotnet_naming_style.async_style.required_suffix      = Async
+
+# ── Rules: bind symbols to styles ────────────────────────────────────
+
+dotnet_naming_rule.public_members_pascal.symbols  = public_members
+dotnet_naming_rule.public_members_pascal.style    = pascal_case
+dotnet_naming_rule.public_members_pascal.severity = warning
+
+dotnet_naming_rule.private_fields_underscore.symbols  = private_fields
+dotnet_naming_rule.private_fields_underscore.style    = underscore_camel
+dotnet_naming_rule.private_fields_underscore.severity = warning
+
+dotnet_naming_rule.constants_pascal.symbols  = constants
+dotnet_naming_rule.constants_pascal.style    = pascal_case
+dotnet_naming_rule.constants_pascal.severity = warning
+# Note: ALL_CAPS for constants is the Java/C convention.
+# .NET convention is PascalCase for constants. MaxRetries, not MAX_RETRIES.
+
+dotnet_naming_rule.interfaces_prefix.symbols  = interfaces
+dotnet_naming_rule.interfaces_prefix.style    = interface_style
+dotnet_naming_rule.interfaces_prefix.severity = error
+# error: the I prefix on interfaces is load-bearing for navigation.
+# Ctrl+B on IFoo goes to the interface. Without the convention, tooling breaks.
+
+dotnet_naming_rule.type_params_prefix.symbols  = type_params
+dotnet_naming_rule.type_params_prefix.style    = type_param_style
+dotnet_naming_rule.type_params_prefix.severity = warning
+
+dotnet_naming_rule.local_variables_camel.symbols  = local_variables
+dotnet_naming_rule.local_variables_camel.style    = camel_case
+dotnet_naming_rule.local_variables_camel.severity = warning
+
+dotnet_naming_rule.async_methods_suffix.symbols  = async_methods
+dotnet_naming_rule.async_methods_suffix.style    = async_style
+dotnet_naming_rule.async_methods_suffix.severity = warning
+# The Async suffix is critical: callers see GetUserAsync and know it returns
+# a Task. Without it, sync and async methods are visually identical.
+
+# ── Imports / usings ─────────────────────────────────────────────────
+
+# Sort System.* usings before others
+# true: System first, then alphabetical
+# false: all alphabetical (preferred by some for consistency)
+dotnet_sort_system_directives_first = true
+
+# Separate import groups with blank line
+# true: blank line between System.*, third-party, and project usings
+dotnet_separate_import_directive_groups = true
+
+# Remove unnecessary usings: keep code clean
+# Rider: Ctrl+Alt+O  |  VS: Ctrl+R, G
+dotnet_remove_unnecessary_imports = true:suggestion
+
+# ── 'this.' qualifier ────────────────────────────────────────────────
+#
+# Never require 'this.' prefix — it's noise.
+# Use _underscore fields to disambiguate constructor params vs fields.
+# 'this.' is only needed for disambiguation (e.g., extension methods).
+dotnet_style_qualification_for_field    = false:suggestion
+dotnet_style_qualification_for_property = false:suggestion
+dotnet_style_qualification_for_method   = false:suggestion
+dotnet_style_qualification_for_event    = false:suggestion
+
+# ── Predefined type keywords ──────────────────────────────────────────
+#
+# Prefer language keywords over BCL type names:
+#   int  NOT  Int32
+#   string  NOT  String
+#   bool  NOT  Boolean
+# Options: true | false
+dotnet_style_predefined_type_for_locals_parameters_members = true:warning
+dotnet_style_predefined_type_for_member_access             = true:warning
+
+# ── Parentheses ───────────────────────────────────────────────────────
+#
+# Don't add unnecessary parentheses in arithmetic:
+#   a + b * c  NOT  a + (b * c)  (precedence is well-known)
+# Options: always_for_clarity | never_if_unnecessary | ignore
+dotnet_style_parentheses_in_arithmetic_binary_operators    = never_if_unnecessary:suggestion
+dotnet_style_parentheses_in_relational_binary_operators    = never_if_unnecessary:suggestion
+dotnet_style_parentheses_in_other_binary_operators         = always_for_clarity:suggestion
+dotnet_style_parentheses_in_other_operators                = never_if_unnecessary:suggestion
+
+# ── Tuple and anonymous type preferences ─────────────────────────────
+
+# Prefer explicitly named tuple elements:
+#   (int count, string name)  NOT  (int, string)
+dotnet_style_explicit_tuple_names = true:suggestion
+
+# Infer tuple element names where possible (C# 7+):
+#   (x, y) inferred from local variables x and y
+dotnet_style_prefer_inferred_tuple_names = true:suggestion
+
+# Infer anonymous type member names:
+#   new { x, y }  NOT  new { x = x, y = y }
+dotnet_style_prefer_inferred_anonymous_type_member_names = true:suggestion
+
+# ── Conditional expressions ───────────────────────────────────────────
+
+# Prefer conditional expression over if-else for assignments:
+#   var x = condition ? a : b;  NOT  if (cond) x = a; else x = b;
+dotnet_style_prefer_conditional_expression_over_assignment = true:suggestion
+
+# Prefer conditional expression over return if-else:
+#   return condition ? a : b;  NOT  if (cond) return a; else return b;
+dotnet_style_prefer_conditional_expression_over_return = true:suggestion
+
+# Prefer compound assignment:
+#   x += 1;  NOT  x = x + 1;
+dotnet_style_prefer_compound_assignment = true:suggestion
+
+# Prefer auto-properties:
+#   public int X { get; set; }  NOT  private int _x; public int X { get { return _x; } set { _x = value; } }
+dotnet_style_prefer_auto_properties = true:warning
+
+# Prefer is-null check over ReferenceEquals:
+#   x is null  NOT  ReferenceEquals(x, null)
+dotnet_style_prefer_is_null_check_over_reference_equality_method = true:warning
+
+# ── Analyzer severity overrides ───────────────────────────────────────
+#
+# These override the default severity for specific Roslyn analyzer rules.
+# Format: dotnet_diagnostic.<RuleId>.severity = <level>
+
+# CA1031: Do not catch general exception types
+# Catching Exception is almost always wrong. Catch specific types.
+dotnet_diagnostic.CA1031.severity = warning
+
+# CA1054 / CA1055 / CA1056: URI parameters should be System.Uri, not string
+# Debatable. string is fine for most APIs. Set to suggestion.
+dotnet_diagnostic.CA1054.severity = suggestion
+dotnet_diagnostic.CA1055.severity = suggestion
+dotnet_diagnostic.CA1056.severity = suggestion
+
+# CA1062: Validate arguments of public methods (null checks)
+# NRT makes this less necessary but still catches some cases
+dotnet_diagnostic.CA1062.severity = suggestion
+
+# CA1305: Specify IFormatProvider
+# Always specify culture when formatting strings
+dotnet_diagnostic.CA1305.severity = warning
+
+# CA1307: Specify StringComparison
+# Always specify StringComparison.OrdinalIgnoreCase etc.
+dotnet_diagnostic.CA1307.severity = warning
+
+# CA1309: Use ordinal string comparison
+dotnet_diagnostic.CA1309.severity = warning
+
+# CA1310: Specify StringComparison for correctness
+dotnet_diagnostic.CA1310.severity = warning
+
+# CA1311: Specify a culture or use an invariant version
+dotnet_diagnostic.CA1311.severity = warning
+
+# CA1416: Platform compatibility — marks platform-specific API usage
+dotnet_diagnostic.CA1416.severity = warning
+
+# CA1711: Identifiers should not have incorrect suffix
+# e.g., don't name a non-exception class "OrderException"
+dotnet_diagnostic.CA1711.severity = suggestion
+
+# CA1720: Identifiers should not contain type names
+# e.g., don't name a property "stringValue"
+dotnet_diagnostic.CA1720.severity = suggestion
+
+# CA1822: Mark members as static
+# If a method doesn't use instance state, it should be static
+dotnet_diagnostic.CA1822.severity = suggestion
+
+# CA1848: Use LoggerMessage delegates for logging (performance)
+# Prefer source-generated logging over string interpolation in hot paths
+dotnet_diagnostic.CA1848.severity = suggestion
+
+# CA2007: Consider calling ConfigureAwait(false)
+# Important in libraries. In ASP.NET Core apps there's no SynchronizationContext.
+# Set to suggestion for apps, warning for libraries.
+dotnet_diagnostic.CA2007.severity = suggestion
+
+# CA2016: Forward CancellationToken parameter
+# Always pass CT through to methods that accept it
+dotnet_diagnostic.CA2016.severity = warning
+
+# CA2201: Do not raise reserved exception types
+# Don't throw Exception, SystemException, NullReferenceException directly
+dotnet_diagnostic.CA2201.severity = warning
+
+# IDE0001: Simplify name (remove unnecessary namespace qualification)
+dotnet_diagnostic.IDE0001.severity = suggestion
+
+# IDE0003: Remove 'this' qualification
+dotnet_diagnostic.IDE0003.severity = suggestion
+
+# IDE0028: Use collection initializers
+dotnet_diagnostic.IDE0028.severity = suggestion
+
+# IDE0044: Add readonly modifier where possible
+dotnet_diagnostic.IDE0044.severity = suggestion
+
+# IDE0051: Remove unused private members
+dotnet_diagnostic.IDE0051.severity = warning
+
+# IDE0052: Remove unread private members
+dotnet_diagnostic.IDE0052.severity = warning
+
+# IDE0059: Remove unnecessary value assignment
+dotnet_diagnostic.IDE0059.severity = warning
+
+# IDE0060: Remove unused parameter
+dotnet_diagnostic.IDE0060.severity = warning
+
+# IDE0079: Remove unnecessary suppression
+dotnet_diagnostic.IDE0079.severity = suggestion
+
+# IDE0090: Simplify new expression: new()  NOT  new MyType()
+dotnet_diagnostic.IDE0090.severity = suggestion
+
+# CS8509: The switch expression does not handle all possible values
+# (non-exhaustive switch) — make this an error so you can't ship it
+dotnet_diagnostic.CS8509.severity = warning
+
+# CS8524: The switch expression does not handle some values of its input type
+dotnet_diagnostic.CS8524.severity = warning
+
+# ── Nullable reference types ──────────────────────────────────────────
+#
+# NRT warnings for nullable reference flows
+# These are controlled by <Nullable>enable</Nullable> in .csproj
+# but severity can be overridden here:
+
+# CS8600: Converting null literal or possible null value to non-nullable type
+dotnet_diagnostic.CS8600.severity = error
+
+# CS8602: Dereference of a possibly null reference
+dotnet_diagnostic.CS8602.severity = error
+
+# CS8603: Possible null reference return
+dotnet_diagnostic.CS8603.severity = error
+
+# CS8604: Possible null reference argument
+dotnet_diagnostic.CS8604.severity = error
+
+# CS8618: Non-nullable property must contain a non-null value on exit
+dotnet_diagnostic.CS8618.severity = error
+
+# CS8625: Cannot convert null literal to non-nullable reference type
+dotnet_diagnostic.CS8625.severity = error
